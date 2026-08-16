@@ -190,7 +190,7 @@ class WorldModel(nn.Module):
         for name, mse in mses.items():
             metrics[f"{name}_mse"] = to_np(mse)
         metrics.update(time_metrics)
-        with torch.cuda.amp.autocast(self._use_amp):
+        with torch.amp.autocast('cuda', enabled=self._use_amp):
             prior_ent = self.dynamics.get_dist(prior).entropy()
             post_ent = self.dynamics.get_dist(post).entropy()
             metrics["prior_ent"] = to_np(torch.mean(prior_ent))
@@ -417,7 +417,7 @@ class ImagBehavior(nn.Module):
         metrics = {}
 
         with (tools.RequiresGrad(self.actor)):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda', enabled=self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
@@ -445,7 +445,7 @@ class ImagBehavior(nn.Module):
                 metrics[f'imagination_horizon_above_{q}'] = to_np(
                     torch.sum(torch.greater(weights, q)) / weights.shape[1])
         with tools.RequiresGrad(self.value):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda', enabled=self._use_amp):
                 value = self.value(value_input)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
                 value_loss = -value.log_prob(target.detach())

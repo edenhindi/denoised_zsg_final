@@ -135,3 +135,15 @@ dmypy.json
 
 # VScode
 .vscode/*
+
+
+# Pytorch
+*.pt
+
+# logs
+*.txt
+*.log
+*.npz
+
+# wandb
+wandb/

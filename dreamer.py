@@ -8,12 +8,13 @@ import pickle
 import sys
 import time
 
+os.environ["GYM_NOTICES_ENABLED"] = "false"  # silence gym's unmaintained-version banner
 import gym
 
-os.environ["MUJOCO_GL"] = "glfw"
+os.environ.setdefault("MUJOCO_GL", "glfw" if os.environ.get("DISPLAY") else "egl")
 
 import numpy as np
-import ruamel.yaml as yaml
+from ruamel.yaml import YAML
 
 sys.path.append(str(pathlib.Path(__file__).parent))
 
@@ -528,7 +529,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
-    configs = yaml.safe_load(
+    yaml = YAML(typ='rt')
+    configs = yaml.load(
         (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
     )
 
