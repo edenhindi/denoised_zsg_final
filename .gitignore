@@ -144,6 +144,6 @@ dmypy.json
 *.txt
 *.log
 *.npz
-
+task_split.json
 # wandb
 wandb/

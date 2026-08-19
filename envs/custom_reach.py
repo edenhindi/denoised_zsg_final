@@ -133,7 +133,7 @@ class CustomReachEnv(RobotTaskEnv):
             self.task.reset()
         return {"image": self._get_obs(), "is_terminal": False, "is_first": True}
 
-    def reset(self):
+    def reset(self, task=None):
         return self.reset_model()
 
     def sample_task(self):

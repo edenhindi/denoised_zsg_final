@@ -34,6 +34,15 @@ defaults:
   max_episode_length: 100
   meta_learning: True
 
+  # Task split (zero-shot generalization). Off by default, so every existing
+  # config keeps its current behavior.
+  task_split: False
+  task_split_seed: 0
+  task_pool_size: 60
+  task_train_size: 20
+  task_val_size: 20
+  task_test_size: 20
+
   # Model
   rnn_detach_every: -1
   dyn_cell: 'gru_layer_norm'
@@ -267,6 +276,45 @@ humanoiddir:
   actor_lr: 6e-05
   model_lr: 2e-4
   value_lr: 6e-05
+
+bandits:
+  steps: 2e5
+  # Must be positive: the world-model horizon curriculum divides by this, and the
+  # default sentinel of -1 drives the horizon negative as training progresses.
+  reach_wm_horizon_limit: 2e4
+  logdir: ./bandits
+  encoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 4 }
+  decoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 4 }
+  actor_dist: 'onehot'
+  imag_gradient: 'reinforce'
+  imag_horizon: 2
+  all_layers: 2
+  train_ratio: 0.1
+  max_episode_length: 20
+  initial_wm_horizon: 10
+  num_meta_episodes: 1
+  meta_learning: True
+  task_split: True
+  # 20/20/20 over 60 tasks. optimal_arm is task_id % num_arms, so a 4-task val
+  # set could not cover 5 arms: the old split put half of val on arm 2 and never
+  # exercised arms 0 or 1, letting a constant policy look good on val.
+  eval_episode_num: 20
+  test_episode_num: 200
+  prefill: 8
+  num_arms: 5
+  distractor_dim: 8
+  reward_mode: 'binary'
+  static_distractor: True
+  generator_seed: 0
+  # Control condition: zero the distractor in every env, train included, so the
+  # only way to solve a task is to explore.
+  no_distractor: False
+
+# Same as `bandits` but the distractor drifts within the episode, so it is harder
+# to bind to a single optimal arm. Run as: --configs bandits bandits_drift
+bandits_drift:
+  logdir: ./bandits_drift
+  static_distractor: False
 
 debug:
   debug: True

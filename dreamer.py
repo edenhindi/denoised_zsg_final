@@ -2,6 +2,7 @@ import argparse
 import datetime
 import functools
 import hashlib
+import json
 import os
 import pathlib
 import pickle
@@ -21,6 +22,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import exploration as expl
 import models
 import tools
+import task_split
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 
@@ -241,9 +243,33 @@ def make_dataset(episodes, config):
     return dataset
 
 
-def make_env(config, mode):
+def make_env(config, mode, pool=None):
     suite, task = config.task.split("_", 1)
-    if suite == "dmc":
+    if suite == "bandits":
+        import envs.bandits as bandits
+
+        generator = bandits.DistractorDataset(
+            num_tasks=config.task_pool_size,
+            num_arms=config.num_arms,
+            distractor_dim=config.distractor_dim,
+            seed=config.generator_seed,
+            reward_mode=config.reward_mode,
+            static_distractor=config.static_distractor,
+        )
+        # One list per split, never the val+test union: surplus envs reset with
+        # no task and fall through to sample_task(), which draws from allowed_ids.
+        allowed_ids = None
+        if pool is not None:
+            allowed_ids = {
+                "train": pool.train_tasks,
+                "eval": pool.val_tasks,
+                "test": pool.test_tasks,
+            }[mode]()
+        env = bandits.BanditEnv(generator, num_steps=config.max_episode_length,
+                                allowed_ids=allowed_ids,
+                                no_distractor=config.no_distractor)
+        env = wrappers.OneHotAction(env)
+    elif suite == "dmc":
         import envs.dmc as dmc
         if config.meta_learning:
             task = task + "meta"
@@ -382,18 +408,47 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
-    make = lambda mode: make_env(config, mode)
+    # The split has to exist before the envs, since each env is constructed with
+    # the ids it is allowed to use.
+    pool = None
+    if config.task_split:
+        pool = task_split.TaskPool(
+            exhaustive_fn=lambda: list(range(config.task_pool_size)),
+            train_size=config.task_train_size,
+            val_size=config.task_val_size,
+            test_size=config.task_test_size,
+            seed=config.task_split_seed,
+        )
+        described = task_split.describe_pool(pool)
+        print(f"Task split: {described}")
+        with open(logdir / "task_split.json", "w") as f:
+            json.dump({**described,
+                       "train": [int(t) for t in pool.train_tasks()],
+                       "val": [int(t) for t in pool.val_tasks()],
+                       "test": [int(t) for t in pool.test_tasks()]}, f, indent=2)
+    make = lambda mode: make_env(config, mode, pool=pool)
     helper_env = make("eval")
     train_envs = [make("train") for _ in range(config.envs)]
     eval_envs = [make("eval") for _ in range(config.envs)]
+    # Separate from eval_envs, which are restricted to val.
+    test_envs = [make("test") for _ in range(config.envs)] if pool is not None else eval_envs
     state2img = helper_env.state2image if hasattr(helper_env, "state2image") else None
-    sample_task = lambda: helper_env.sample_task() if config.meta_learning else None
+    if pool is not None:
+        sample_train_task = pool.sample_train
+        sample_val_task = pool.sample_val
+        sample_test_task = pool.sample_test
+    else:
+        sample_task = lambda: helper_env.sample_task() if config.meta_learning else None
+        sample_train_task = sample_val_task = sample_test_task = sample_task
     if config.envs > 1:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]
+        test_envs = ([Parallel(env, "process") for env in test_envs]
+                     if pool is not None else eval_envs)
     else:
         train_envs = [Damy(env) for env in train_envs]
         eval_envs = [Damy(env) for env in eval_envs]
+        test_envs = [Damy(env) for env in test_envs] if pool is not None else eval_envs
     acts = helper_env.action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
@@ -418,7 +473,7 @@ def main(config):
             logprob = random_actor.log_prob(action)
             return {"action": action, "logprob": logprob}, None
 
-        prefill_tasks = [sample_task() for _ in range(config.prefill)]
+        prefill_tasks = [sample_train_task() for _ in range(config.prefill)]
         _, steps_taken, _ = tools.simulate(
             random_agent,
             train_envs,
@@ -451,7 +506,17 @@ def main(config):
 
     eval_scheduler = tools.Every(config.eval_every_collection_episodes)
     collected_episodes = 0
-    eval_tasks = [sample_task() for _ in range(config.eval_episode_num)]
+    # Fixed across evaluations, so best_return comparisons over training are
+    # measuring the model rather than the task draw. Sampled without replacement
+    # so a small val pool is covered evenly.
+    if pool is not None:
+        eval_tasks = pool.sample_val_batch(config.eval_episode_num)
+        # Held-out return is only interpretable next to seen-task return under the
+        # same policy, so evaluate a matched set of train tasks too.
+        train_eval_tasks = pool.sample_train_batch(config.eval_episode_num)
+    else:
+        eval_tasks = [sample_val_task() for _ in range(config.eval_episode_num)]
+        train_eval_tasks = None
     training_times = []
     best_return = -np.inf
     eval_policy = functools.partial(agent, training=False)
@@ -471,6 +536,24 @@ def main(config):
                 state2image=state2img,
                 num_meta_episodes=config.num_meta_episodes,
             )
+            if train_eval_tasks is not None:
+                # Same policy, same episode count, seen tasks: the difference is
+                # attributable to task familiarity rather than to policy mode.
+                _, _, train_eval_return = tools.simulate(
+                    eval_policy,
+                    eval_envs if pool is None else train_envs,
+                    train_eval_tasks,
+                    eval_eps,
+                    config.evaldir,
+                    logger,
+                    is_eval=True,
+                    state2image=state2img,
+                    num_meta_episodes=config.num_meta_episodes,
+                    # Without its own prefix this pass overwrites the val pass's
+                    # eval_* keys at the same env_step.
+                    metric_prefix="train_eval",
+                )
+                logger.scalar("generalization_gap", train_eval_return - eval_return)
             if eval_return > best_return:
                 best_return = eval_return
                 torch.save(agent.state_dict(), logdir / "best_model.pt")
@@ -483,7 +566,7 @@ def main(config):
             training_times.clear()
         dreamer_training_time = time.time()
         print("Start training.")
-        train_tasks = [sample_task() for _ in range(config.envs)]
+        train_tasks = [sample_train_task() for _ in range(config.envs)]
         _, steps_taken, _ = tools.simulate(
             agent,
             train_envs,
@@ -505,19 +588,19 @@ def main(config):
     agent.load_state_dict(torch.load(logdir / "best_model.pt"), strict=False)
     _, _, test_return = tools.simulate(
         eval_policy,
-        eval_envs,
-        [sample_task() for _ in range(config.test_episode_num)],
+        test_envs,
+        [sample_test_task() for _ in range(config.test_episode_num)],
         eval_eps,
         config.evaldir,
         logger,
         is_eval=True,
         state2image=state2img,
         num_meta_episodes=config.num_meta_episodes,
+        metric_prefix="test",
     )
-    logger.scalar("test_return", test_return)
     print(f"Test return: {test_return:.1f}.")
 
-    for env in train_envs + eval_envs:
+    for env in train_envs + eval_envs + (test_envs if pool is not None else []):
         try:
             env.close()
         except Exception:

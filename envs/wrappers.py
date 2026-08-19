@@ -4,6 +4,11 @@ import numpy as np
 import uuid
 
 
+def _reset(env, task):
+    """Forward the task only when there is one: non-meta envs take no reset args."""
+    return env.reset() if task is None else env.reset(task)
+
+
 class TimeLimit(gym.Wrapper):
     def __init__(self, env, duration):
         super().__init__(env)
@@ -21,9 +26,9 @@ class TimeLimit(gym.Wrapper):
             self._step = None
         return obs, reward, done, info
 
-    def reset(self):
+    def reset(self, task=None):
         self._step = 0
-        return self.env.reset()
+        return _reset(self.env, task)
 
 
 class NormalizeActions(gym.Wrapper):
@@ -69,8 +74,8 @@ class OneHotAction(gym.Wrapper):
             raise ValueError(f"Invalid one-hot action:\n{action}")
         return self.env.step(index)
 
-    def reset(self):
-        return self.env.reset()
+    def reset(self, task=None):
+        return _reset(self.env, task)
 
     def _sample_action(self):
         actions = self.env.action_space.n
@@ -103,8 +108,8 @@ class RewardObs(gym.Wrapper):
             obs["reward"] = reward
         return obs, reward, done, info
 
-    def reset(self):
-        obs = self.env.reset()
+    def reset(self, task=None):
+        obs = _reset(self.env, task)
         if "reward" not in obs:
             obs["reward"] = 0.0
         return obs
@@ -117,6 +122,9 @@ class SelectAction(gym.Wrapper):
 
     def step(self, action):
         return self.env.step(action[self._key])
+
+    def reset(self, task=None):
+        return _reset(self.env, task)
 
 
 class TimeAugmentedState(gym.Wrapper):
@@ -144,8 +152,8 @@ class TimeAugmentedState(gym.Wrapper):
     def observation_space(self, value):
         self._observation_space = value
 
-    def reset(self):
-        obs = self.env.reset()
+    def reset(self, task=None):
+        obs = _reset(self.env, task)
         self._time = 0
         obs["time_step"] = self._time
         return obs
@@ -186,8 +194,9 @@ class MetaLearningEnv(gym.Wrapper):
     def reset(self, task=None):
         self._current_step = 0
         self._current_episode = 0
+        task = task if task is not None else self.sample_task()
         self._set_task(task)
-        return self.env.reset()
+        return self.env.reset(task)
 
     def sample_task(self):
         return self.env.sample_task()
@@ -203,7 +212,7 @@ class UUID(gym.Wrapper):
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.id = f"{timestamp}-{str(uuid.uuid4().hex)}"
 
-    def reset(self):
+    def reset(self, task=None):
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.id = f"{timestamp}-{str(uuid.uuid4().hex)}"
-        return self.env.reset()
+        return _reset(self.env, task)

@@ -96,7 +96,7 @@ class RoomNaviNew(gym.Env):
 
         return {"state": self.normalize_obs(self._env_state.copy()), "is_terminal": False, "is_first": True}
 
-    def reset(self):
+    def reset(self, task=None):
         return self.reset_model()
 
     def state_transition(self, action):

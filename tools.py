@@ -86,7 +86,7 @@ class Logger:
 
 
 def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=None, state2image=None,
-             num_meta_episodes=1):
+             num_meta_episodes=1, metric_prefix="eval"):
     is_meta = num_meta_episodes > 1
     total_env_steps = 0
     completed_tasks = []
@@ -99,6 +99,7 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
     done = np.ones(len(envs), bool)
     eval_lengths = []
     eval_scores = []
+    eval_task_scores = []
     score = None
     logged_video = False
     if is_meta:
@@ -186,12 +187,18 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
                         add_to_cache(cache, env_id, t)
 
                     # and do the required simulations
-                    save_episodes(directory, {env_id: cache[env_id]})
+                    # Eval episodes are consumed straight from `cache` (scoring,
+                    # video, and eval_dataset all read it), so writing them to disk
+                    # only costs files.
+                    if not is_eval:
+                        save_episodes(directory, {env_id: cache[env_id]})
                     if is_eval:
                         score, length, score_per_episode = _simulator_helper_eval(env_id, cache[env_id],
                                                                                    cache, num_meta_episodes)
                         eval_scores.append(score)
                         eval_lengths.append(length)
+                        # Episodes finish in env order, not task order.
+                        eval_task_scores.append((task, score))
                         if is_meta:
                             for j in range(len(scores_per_episode)):
                                 scores_per_episode[j].append(score_per_episode[j])
@@ -214,7 +221,7 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
                                      zip(meta_episode_numbers, curr_cache_reordered)])
 
                             if video is not None:
-                                logger.video(f"eval_policy", video[None])
+                                logger.video(f"{metric_prefix}_policy", video[None])
                             logged_video = True
                     else:
                         _simulator_helper_train(logger, cache[env_id], cache, limit)
@@ -233,16 +240,20 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
 
         if is_meta:
             for j in range(num_meta_episodes):
-                logger.scalar(f"eval_return/episode{str(j)}", score_per_episode[j])
+                logger.scalar(f"{metric_prefix}_return/episode{str(j)}", score_per_episode[j])
             if num_meta_episodes == 2:
-                logger.scalar(f"eval_return/diff",
+                logger.scalar(f"{metric_prefix}_return/diff",
                               score_per_episode[1] - score_per_episode[0])
-            logger.scalar(f"eval_return/sum", score)
+            logger.scalar(f"{metric_prefix}_return/sum", score)
         else:
-            logger.scalar(f"eval_return", score)
-        logger.scalar(f"eval_length", length)
+            logger.scalar(f"{metric_prefix}_return", score)
+        # Per-task series: the mean hides whether a low eval is every task
+        # scoring badly or a few at zero.
+        for task, task_score in sorted(eval_task_scores, key=lambda x: str(x[0])):
+            logger.scalar(f"{metric_prefix}_return/task{task}", task_score)
+        logger.scalar(f"{metric_prefix}_length", length)
         logger.scalar(
-            f"eval_episodes", episode_num
+            f"{metric_prefix}_episodes", episode_num
         )
         logger.write()
         # keep only last item for saving memory. this cache is used for video_pred later
