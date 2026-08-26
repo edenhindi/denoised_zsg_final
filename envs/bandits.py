@@ -69,13 +69,14 @@ class DistractorDataset:
 
 class BanditEnv(gym.Env):
     def __init__(self, generator: DistractorDataset, num_steps: int, allowed_ids=None,
-                 seed=0, no_distractor=False):
+                 seed=0, use_distractor=True):
         super().__init__()
         self.generator = generator
         self.num_steps = num_steps
-        # Control condition: zeros the distractor everywhere, so the shortcut
-        # "distractor -> optimal arm" does not exist and only exploration works.
-        self.no_distractor = no_distractor
+        # Turn off for the control condition: zeros the distractor everywhere, so the
+        # shortcut "distractor -> optimal arm" does not exist and only exploration
+        # works.
+        self.use_distractor = use_distractor
         self.num_arms = generator.num_arms
         self.distractor_dim = generator.distractor_dim
 
@@ -135,7 +136,7 @@ class BanditEnv(gym.Env):
     def _obs(self, is_first=False):
         frac = self._t / self.num_steps
         distractor = self.generator.distractor(self._current_task_id, frac)
-        if self.no_distractor:
+        if not self.use_distractor:
             distractor = np.zeros_like(distractor)
         one_hot = np.zeros(self.num_arms, dtype=np.float32)
         if self._prev_action_idx >= 0:

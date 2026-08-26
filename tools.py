@@ -128,6 +128,10 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
             # action will be added to transition in add_to_cache
             t["reward"] = 0.0
             t["discount"] = 1.0
+            try:
+                t["task_id"] = np.array(int(envs[env_index].get_task()), dtype=np.int64)
+            except (AttributeError, TypeError, ValueError):
+                t["task_id"] = np.array(-1, dtype=np.int64)
             if is_meta:
                 t["meta_episode_reset"] = False
             partial_episodes[env_index] = [t]
@@ -165,6 +169,8 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
             transition["meta_episode_reset"] = info.get("meta_episode_reset", np.array(1 - float(d)))
+            # -1 means "no label"; the classifier loss masks those out.
+            transition["task_id"] = np.array(info.get("task_id", -1), dtype=np.int64)
             partial_episodes[env_index].append(transition)
 
         # handle done events

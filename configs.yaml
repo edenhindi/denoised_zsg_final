@@ -15,7 +15,7 @@ defaults:
   reset_every: 0
   device: 'cuda:0'
   compile: True
-  precision: 32
+  precision: 16
   debug: False
   expl_gifs: False
   video_pred_log: False
@@ -42,13 +42,15 @@ defaults:
   task_train_size: 20
   task_val_size: 20
   task_test_size: 20
+  # Contiguous ids per split, so train ids are dense class indices for xi's classifier.
+  task_split_contiguous: True
 
   # Model
   rnn_detach_every: -1
   dyn_cell: 'gru_layer_norm'
   dyn_hidden: 64
-  dyn_deter: 512
-  dyn_stoch: 16
+  dyn_deter: 128
+  dyn_stoch: 4
   dyn_discrete: 16
   dyn_input_layers: 1
   dyn_output_layers: 1
@@ -58,6 +60,40 @@ defaults:
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
   dyn_temp_post: True
+
+  # Set False for the control condition: zeros the bandits distractor in every env,
+  # train included, so the shortcut "distractor -> optimal arm" does not exist and
+  # the only way to solve a task is to explore. In defaults so it is a CLI flag
+  # without passing the bandits block: --use_distractor False
+  use_distractor: True
+
+  # Exogenous module. An action-free RSSM (xi_t -> xi_{t+1}) whose decoded output is
+  # added to the endogenous decoder's, for observation keys only. The policy and the
+  # imagination rollout stay endogenous-only, so xi can absorb observation structure
+  # the agent cannot act on without polluting the values it optimizes.
+  # Off by default: use_exo False leaves every existing config bit-identical.
+  use_exo: False
+  xi_deter: 128
+  xi_stoch: 4
+  xi_discrete: 16
+  xi_hidden: 64
+  xi_input_layers: 1
+  xi_output_layers: 1
+  xi_kl_scale: 1.0
+  # No free nats for xi, unlike kl_free for the endogenous stream.
+  xi_kl_free: 0.0
+  xi_dyn_scale: 0.5
+  xi_rep_scale: 0.1
+  # Context classifier weight. Needs task_split_contiguous and labelled task_ids.
+  xi_ctx_scale: 1.0
+  # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
+  xi_head_input: 'feat'
+
+  # Detached linear probes from deter/stoch to task id and optimal arm. Diagnostic
+  # only: they never affect the world model. Needs labelled task_ids.
+  probe_state: False
+  probe_early_steps: 3
+
   grad_heads: [ 'decoder', 'reward', 'cont' ]
   units: 128
   reward_layers: 2
@@ -278,7 +314,7 @@ humanoiddir:
   value_lr: 6e-05
 
 bandits:
-  steps: 2e5
+  steps: 5e5
   # Must be positive: the world-model horizon curriculum divides by this, and the
   # default sentinel of -1 drives the horizon negative as training progresses.
   reach_wm_horizon_limit: 2e4
@@ -306,9 +342,10 @@ bandits:
   reward_mode: 'binary'
   static_distractor: True
   generator_seed: 0
-  # Control condition: zero the distractor in every env, train included, so the
-  # only way to solve a task is to explore.
-  no_distractor: False
+
+  actor_lr: 3e-04
+  model_lr: 1e-3
+  value_lr: 3e-04
 
 # Same as `bandits` but the distractor drifts within the episode, so it is harder
 # to bind to a single optimal arm. Run as: --configs bandits bandits_drift

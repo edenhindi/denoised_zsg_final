@@ -53,7 +53,7 @@ class TaskPool:
     """
 
     def __init__(self, train_size, val_size, test_size=None, sample_fn=None,
-                 size=None, seed=0, exhaustive_fn=None):
+                 size=None, seed=0, exhaustive_fn=None, contiguous=False):
         if exhaustive_fn is not None:
             pool = list(exhaustive_fn())
         elif sample_fn is not None:
@@ -68,7 +68,17 @@ class TaskPool:
             by_key.setdefault(canonicalize_task(task), task)
         ordered = [by_key[key] for key in sorted(by_key, key=repr)]
 
-        random.Random(seed).shuffle(ordered)
+        # Contiguous keeps train ids dense for the exogenous context classifier, but
+        # arm coverage then needs each split size to be a multiple of num_arms.
+        if contiguous:
+            # repr-order is lexicographic ("10" < "2"), which is not contiguous.
+            if not all(isinstance(t, (int, np.integer)) for t in ordered):
+                raise ValueError(
+                    "contiguous splits require integer tasks; "
+                    f"got {type(ordered[0]).__name__}")
+            ordered = sorted(int(t) for t in ordered)
+        else:
+            random.Random(seed).shuffle(ordered)
         n = len(ordered)
         n_train, n_val = int(train_size), int(val_size)
         n_test = n - n_train - n_val if test_size is None else int(test_size)

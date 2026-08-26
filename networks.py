@@ -334,6 +334,298 @@ class RSSM(nn.Module):
         return loss, value, dyn_loss, rep_loss
 
 
+class XiRSSM(nn.Module):
+    """Action-free RSSM for the exogenous latent xi.
+
+    Mirrors RSSM's dict-state convention ({stoch, deter, logit|mean,std}) but the
+    transition is xi_t -> xi_{t+1} with no action input, so the exogenous stream
+    evolves independently of what the agent does. Used by the world model only:
+    the policy and the imagination rollout never see xi.
+    """
+
+    def __init__(
+        self,
+        stoch=30,
+        deter=200,
+        hidden=200,
+        layers_input=1,
+        layers_output=1,
+        discrete=False,
+        act="SiLU",
+        norm="LayerNorm",
+        mean_act="none",
+        std_act="softplus",
+        min_std=0.1,
+        cell="gru",
+        unimix_ratio=0.01,
+        initial="learned",
+        embed=None,
+        device=None,
+        num_contexts=0,
+    ):
+        super(XiRSSM, self).__init__()
+        self._stoch = stoch
+        self._deter = deter
+        self._hidden = hidden
+        self._min_std = min_std
+        self._layers_input = layers_input
+        self._layers_output = layers_output
+        self._discrete = discrete
+        act = getattr(torch.nn, act)
+        norm = getattr(torch.nn, norm)
+        self._mean_act = mean_act
+        self._std_act = std_act
+        self._unimix_ratio = unimix_ratio
+        self._initial = initial
+        self._embed = embed
+        self._device = device
+
+        # No action term here: this is the only structural difference from RSSM.
+        inp_layers = []
+        if self._discrete:
+            inp_dim = self._stoch * self._discrete
+        else:
+            inp_dim = self._stoch
+        for i in range(self._layers_input):
+            inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+            inp_layers.append(norm(self._hidden, eps=1e-03))
+            inp_layers.append(act())
+            if i == 0:
+                inp_dim = self._hidden
+        self._inp_layers = nn.Sequential(*inp_layers)
+        self._inp_layers.apply(tools.weight_init)
+
+        if cell == "gru":
+            self._cell = GRUCell(self._hidden, self._deter)
+            self._cell.apply(tools.weight_init)
+        elif cell == "gru_layer_norm":
+            self._cell = GRUCell(self._hidden, self._deter, norm=True)
+            self._cell.apply(tools.weight_init)
+        else:
+            raise NotImplementedError(cell)
+
+        img_out_layers = []
+        inp_dim = self._deter
+        for i in range(self._layers_output):
+            img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+            img_out_layers.append(norm(self._hidden, eps=1e-03))
+            img_out_layers.append(act())
+            if i == 0:
+                inp_dim = self._hidden
+        self._img_out_layers = nn.Sequential(*img_out_layers)
+        self._img_out_layers.apply(tools.weight_init)
+
+        obs_out_layers = []
+        inp_dim = self._deter + self._embed
+        for i in range(self._layers_output):
+            obs_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+            obs_out_layers.append(norm(self._hidden, eps=1e-03))
+            obs_out_layers.append(act())
+            if i == 0:
+                inp_dim = self._hidden
+        self._obs_out_layers = nn.Sequential(*obs_out_layers)
+        self._obs_out_layers.apply(tools.weight_init)
+
+        if self._discrete:
+            self._ims_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
+            self._ims_stat_layer.apply(tools.weight_init)
+            self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
+            self._obs_stat_layer.apply(tools.weight_init)
+        else:
+            self._ims_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._ims_stat_layer.apply(tools.weight_init)
+            self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._obs_stat_layer.apply(tools.weight_init)
+
+        # Predicts which task the sequence came from. Without it xi's KL is driven to
+        # zero and xi collapses to a constant.
+        self._num_contexts = int(num_contexts)
+        if self._num_contexts > 0:
+            self._ctx_cls = nn.Linear(self._deter, self._num_contexts)
+            self._ctx_cls.apply(tools.weight_init)
+
+        if self._initial == "learned":
+            self.W = torch.nn.Parameter(
+                torch.zeros((1, self._deter), device=torch.device(self._device)),
+                requires_grad=True,
+            )
+
+    def context_logits(self, state):
+        return self._ctx_cls(state["deter"])
+
+    @property
+    def feat_size(self):
+        if self._discrete:
+            return self._stoch * self._discrete + self._deter
+        return self._stoch + self._deter
+
+    def initial(self, batch_size):
+        deter = torch.zeros(batch_size, self._deter).to(self._device)
+        if self._discrete:
+            state = dict(
+                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
+                ),
+                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
+                ),
+                deter=deter,
+            )
+        else:
+            state = dict(
+                mean=torch.zeros([batch_size, self._stoch]).to(self._device),
+                std=torch.zeros([batch_size, self._stoch]).to(self._device),
+                stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
+                deter=deter,
+            )
+        if self._initial == "zeros":
+            return state
+        elif self._initial == "learned":
+            state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
+            state["stoch"] = self.get_stoch(state["deter"])
+            return state
+        else:
+            raise NotImplementedError(self._initial)
+
+    def observe(self, embed, is_first, state=None):
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        if state is None:
+            state = self.initial(embed.shape[0])
+        # (batch, time, ch) -> (time, batch, ch)
+        embed, is_first = swap(embed), swap(is_first)
+        post, prior = tools.static_scan(
+            lambda prev_state, embed, is_first: self.obs_step(
+                prev_state[0], embed, is_first
+            ),
+            (embed, is_first),
+            (state, state),
+        )
+        post = {k: swap(v) for k, v in post.items()}
+        prior = {k: swap(v) for k, v in prior.items()}
+        return post, prior
+
+    def imagine(self, horizon, state):
+        """Action-free prior rollout. Used for logging only, never for behavior."""
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        assert isinstance(state, dict), state
+        priors = []
+        prior = state
+        for _ in range(horizon):
+            prior = self.img_step(prior)
+            priors.append(prior)
+        prior = {k: torch.stack([p[k] for p in priors], 0) for k in priors[0].keys()}
+        return {k: swap(v) for k, v in prior.items()}
+
+    def get_feat(self, state):
+        stoch = state["stoch"]
+        if self._discrete:
+            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+            stoch = stoch.reshape(shape)
+        return torch.cat([stoch, state["deter"]], -1)
+
+    def get_dist(self, state, dtype=None):
+        if self._discrete:
+            logit = state["logit"]
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
+            )
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
+            )
+        return dist
+
+    def obs_step(self, prev_state, embed, is_first, sample=True):
+        if torch.sum(is_first) > 0:
+            is_first = is_first[:, None]
+            init_state = self.initial(len(is_first))
+            for key, val in prev_state.items():
+                is_first_r = torch.reshape(
+                    is_first,
+                    is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+                )
+                prev_state[key] = val * (1.0 - is_first_r) + init_state[key] * is_first_r
+        prior = self.img_step(prev_state, sample)
+        x = torch.cat([prior["deter"], embed], -1)
+        x = self._obs_out_layers(x)
+        stats = self._suff_stats_layer("obs", x)
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
+        post = {"stoch": stoch, "deter": prior["deter"], **stats}
+        return post, prior
+
+    def img_step(self, prev_state, sample=True):
+        """xi_t -> xi_{t+1}, with no dependence on the action."""
+        prev_stoch = prev_state["stoch"]
+        if self._discrete:
+            shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+            prev_stoch = prev_stoch.reshape(shape)
+        x = self._inp_layers(prev_stoch)
+        deter = prev_state["deter"]
+        x, deter = self._cell(x, [deter])
+        deter = deter[0]  # Keras wraps the state in a list.
+        x = self._img_out_layers(x)
+        stats = self._suff_stats_layer("ims", x)
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
+        prior = {"stoch": stoch, "deter": deter, **stats}
+        return prior
+
+    def get_stoch(self, deter):
+        x = self._img_out_layers(deter)
+        stats = self._suff_stats_layer("ims", x)
+        dist = self.get_dist(stats)
+        return dist.mode()
+
+    def _suff_stats_layer(self, name, x):
+        if name == "ims":
+            x = self._ims_stat_layer(x)
+        elif name == "obs":
+            x = self._obs_stat_layer(x)
+        else:
+            raise NotImplementedError
+        if self._discrete:
+            logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
+            return {"logit": logit}
+        mean, std = torch.split(x, [self._stoch] * 2, -1)
+        mean = {
+            "none": lambda: mean,
+            "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
+        }[self._mean_act]()
+        std = {
+            "softplus": lambda: torch.softplus(std),
+            "abs": lambda: torch.abs(std + 1),
+            "sigmoid": lambda: torch.sigmoid(std),
+            "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
+        }[self._std_act]()
+        std = std + self._min_std
+        return {"mean": mean, "std": std}
+
+    def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
+        kld = torchd.kl.kl_divergence
+        dist = lambda x: self.get_dist(x)
+        sg = lambda x: {k: v.detach() for k, v in x.items()}
+
+        rep_loss = value = kld(
+            dist(post) if self._discrete else dist(post)._dist,
+            dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
+        )
+        dyn_loss = kld(
+            dist(sg(post)) if self._discrete else dist(sg(post))._dist,
+            dist(prior) if self._discrete else dist(prior)._dist,
+        )
+        rep_loss = torch.mean(torch.clip(rep_loss, min=free))
+        dyn_loss = torch.mean(torch.clip(dyn_loss, min=free))
+        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+
+        return loss, value, dyn_loss, rep_loss
+
+
 class MultiEncoder(nn.Module):
     def __init__(
         self,
@@ -352,9 +644,9 @@ class MultiEncoder(nn.Module):
     ):
         super(MultiEncoder, self).__init__()
         if input_reward is True:
-            excluded = ("is_first", "is_last", "is_terminal")
+            excluded = ("is_first", "is_last", "is_terminal", "task_id")
         else:
-            excluded = ("is_first", "is_last", "is_terminal", "reward")
+            excluded = ("is_first", "is_last", "is_terminal", "reward", "task_id")
 
         shapes = {k: v for k, v in shapes.items() if k not in excluded}
         self.cnn_shapes = {
@@ -418,13 +710,14 @@ class MultiDecoder(nn.Module):
         cnn_sigmoid,
         image_dist,
         vector_dist,
-            input_reward
+            input_reward,
+            xi_feat_size=0,
     ):
         super(MultiDecoder, self).__init__()
         if input_reward is True:
-            excluded = ("is_first", "is_last", "is_terminal")
+            excluded = ("is_first", "is_last", "is_terminal", "task_id")
         else:
-            excluded = ("is_first", "is_last", "is_terminal", "reward")
+            excluded = ("is_first", "is_last", "is_terminal", "reward", "task_id")
         shapes = {k: v for k, v in shapes.items() if k not in excluded}
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
@@ -436,6 +729,19 @@ class MultiDecoder(nn.Module):
         }
         print("Decoder CNN shapes:", self.cnn_shapes)
         print("Decoder MLP shapes:", self.mlp_shapes)
+        # When on, a second decoder branch reads the exogenous feature and its output
+        # is added to the endogenous one. Only genuine observation keys get that
+        # branch: reward and time_step are auxiliary signals the policy depends on,
+        # so they stay purely endogenous. For an image env that leaves the CNN keys
+        # plus nothing else; for bandits it leaves "state" alone.
+        self._use_xi = xi_feat_size > 0
+        self._xi_excluded = ("reward", "time_step")
+        self.xi_mlp_shapes = {
+            k: v for k, v in self.mlp_shapes.items() if k not in self._xi_excluded
+        }
+        if self._use_xi:
+            print("Decoder exogenous CNN shapes:", self.cnn_shapes)
+            print("Decoder exogenous MLP shapes:", self.xi_mlp_shapes)
 
         if self.cnn_shapes:
             some_shape = list(self.cnn_shapes.values())[0]
@@ -450,6 +756,18 @@ class MultiDecoder(nn.Module):
                 minres,
                 cnn_sigmoid=cnn_sigmoid,
             )
+            if self._use_xi:
+                # Same output shape as the endogenous branch, so the two means add.
+                self._cnn_xi = ConvDecoder(
+                    xi_feat_size,
+                    shape,
+                    cnn_depth,
+                    act,
+                    norm,
+                    kernel_size,
+                    minres,
+                    cnn_sigmoid=cnn_sigmoid,
+                )
         if self.mlp_shapes:
             self._mlp = MLP(
                 feat_size,
@@ -460,24 +778,89 @@ class MultiDecoder(nn.Module):
                 norm,
                 vector_dist,
             )
+            # Sized to xi_mlp_shapes, so this branch cannot emit reward/time_step.
+            if self._use_xi and self.xi_mlp_shapes:
+                self._mlp_xi = MLP(
+                    xi_feat_size,
+                    self.xi_mlp_shapes,
+                    mlp_layers,
+                    mlp_units,
+                    act,
+                    norm,
+                    vector_dist,
+                )
         self._image_dist = image_dist
 
-    def forward(self, features):
-        dists = {}
+    def forward(self, features, xi_features=None):
+        """Unchanged contract: a dict holding every key this decoder emits."""
+        combined, _, _ = self.forward_parts(features, xi_features)
+        return combined
+
+    def forward_parts(self, features, xi_features=None):
+        """Decode into (combined, endo_only, exo_only), each a dict keyed as before.
+
+        `combined` holds every key, exactly as `forward` always has, and is what the
+        loss consumes. Observation keys are the sum of the two branches, taken on the
+        pre-distribution mean so that one distribution -- and so one likelihood term
+        -- is built from the sum. Keys with no exogenous branch (reward, time_step)
+        pass through as the endogenous prediction alone.
+
+        `endo_only` and `exo_only` decode the branches separately for logging and
+        carry no loss; `exo_only` holds only the keys that have an exogenous branch.
+        Both are None when xi is off.
+        """
+        use_xi = self._use_xi and xi_features is not None
+        combined, endo_only, exo_only = {}, {}, {}
+
         if self.cnn_shapes:
-            feat = features
-            outputs = self._cnn(feat)
             split_sizes = [v[-1] for v in self.cnn_shapes.values()]
-            outputs = torch.split(outputs, split_sizes, -1)
-            dists.update(
-                {
-                    key: self._make_image_dist(output)
-                    for key, output in zip(self.cnn_shapes.keys(), outputs)
+
+            def _split_image(x):
+                return {
+                    key: self._make_image_dist(out)
+                    for key, out in zip(
+                        self.cnn_shapes.keys(), torch.split(x, split_sizes, -1)
+                    )
                 }
-            )
+
+            mean = self._cnn(features)
+            if use_xi:
+                xi_mean = self._cnn_xi(xi_features)
+                combined.update(_split_image(mean + xi_mean))
+                endo_only.update(_split_image(mean))
+                exo_only.update(_split_image(xi_mean))
+            else:
+                combined.update(_split_image(mean))
+
         if self.mlp_shapes:
-            dists.update(self._mlp(features))
-        return dists
+            stats = self._mlp.forward_stats(features)
+
+            def _make_vector(source):
+                return {
+                    name: self._mlp.dist(
+                        self._mlp._dist, mean, std, self.mlp_shapes[name]
+                    )
+                    for name, (mean, std) in source.items()
+                }
+
+            if use_xi and self.xi_mlp_shapes:
+                xi_stats = self._mlp_xi.forward_stats(xi_features)
+                # Every key survives; only those with an exogenous branch are summed.
+                total = {
+                    name: (mean + xi_stats[name][0], std)
+                    if name in xi_stats
+                    else (mean, std)
+                    for name, (mean, std) in stats.items()
+                }
+                combined.update(_make_vector(total))
+                endo_only.update(_make_vector(stats))
+                exo_only.update(_make_vector(xi_stats))
+            else:
+                combined.update(_make_vector(stats))
+
+        if not use_xi:
+            return combined, None, None
+        return combined, endo_only, exo_only
 
     def _make_image_dist(self, mean):
         if self._image_dist == "normal":
@@ -680,7 +1063,12 @@ class MLP(nn.Module):
                 self.std_layer = nn.Linear(units, np.prod(self._shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
 
-    def forward(self, features, dtype=None):
+    def forward_stats(self, features):
+        """Return raw (mean, std) before the distribution is built.
+
+        Split out of forward so that an additive decoder can sum the endogenous and
+        exogenous means and build a single distribution from the sum.
+        """
         x = features
         if self._symlog_inputs:
             x = tools.symlog(x)
@@ -688,22 +1076,33 @@ class MLP(nn.Module):
         if self._shape is None:
             return out
         if isinstance(self._shape, dict):
-            dists = {}
+            stats = {}
             for name, shape in self._shape.items():
                 mean = self.mean_layer[name](out)
                 if self._std == "learned":
                     std = self.std_layer[name](out)
                 else:
                     std = self._std
-                dists.update({name: self.dist(self._dist, mean, std, shape)})
-            return dists
+                stats[name] = (mean, std)
+            return stats
+        mean = self.mean_layer(out)
+        if self._std == "learned":
+            std = self.std_layer(out)
         else:
-            mean = self.mean_layer(out)
-            if self._std == "learned":
-                std = self.std_layer(out)
-            else:
-                std = self._std
-            return self.dist(self._dist, mean, std, self._shape)
+            std = self._std
+        return (mean, std)
+
+    def forward(self, features, dtype=None):
+        stats = self.forward_stats(features)
+        if self._shape is None:
+            return stats
+        if isinstance(self._shape, dict):
+            return {
+                name: self.dist(self._dist, mean, std, self._shape[name])
+                for name, (mean, std) in stats.items()
+            }
+        mean, std = stats
+        return self.dist(self._dist, mean, std, self._shape)
 
     def dist(self, dist, mean, std, shape):
         if dist == "normal":

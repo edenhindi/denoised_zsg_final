@@ -38,6 +38,13 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+        # Reward-free encoder for xi, mirroring online-zsg's q(y_t | y_prev, o_t):
+        # only the endogenous stream may integrate reward feedback.
+        self.xi_encoder = None
+        if config.use_exo:
+            self.xi_encoder = networks.MultiEncoder(
+                shapes, **{**config.encoder, "input_reward": False}
+            )
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -67,12 +74,49 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
 
+        # Exogenous stream: an action-free RSSM whose decoded output is added to the
+        # endogenous decoder's. It feeds the observation reconstruction only -- the
+        # reward and cont heads stay endogenous, because the policy imagines with the
+        # endogenous state alone and must never be asked to predict returns that
+        # depend on a latent it cannot roll forward.
+        self._use_exo = config.use_exo
+        self.xi_dynamics = None
+        xi_feat_size = 0
+        if self._use_exo:
+            self.xi_dynamics = networks.XiRSSM(
+                config.xi_stoch,
+                config.xi_deter,
+                config.xi_hidden,
+                config.xi_input_layers,
+                config.xi_output_layers,
+                config.xi_discrete,
+                config.act,
+                config.norm,
+                config.dyn_mean_act,
+                config.dyn_std_act,
+                config.dyn_min_std,
+                config.dyn_cell,
+                config.unimix_ratio,
+                config.initial,
+                self.xi_encoder.outdim if self.xi_encoder is not None else self.embed_size,
+                config.device,
+                config.task_train_size if config.xi_ctx_scale > 0 else 0,
+            )
+            xi_feat_size = (
+                self.xi_dynamics.feat_size
+                if config.xi_head_input == "feat"
+                else config.xi_deter
+            )
+
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            feat_size, shapes, **config.decoder, xi_feat_size=xi_feat_size
         )
         if config.reconstruction_window > 0:
             self.heads["multi_decoder"] = networks.MultiDecoder(
-                feat_size + self.embed_size, shapes, **config.decoder
+                feat_size + self.embed_size,
+                shapes,
+                **config.decoder,
+                xi_feat_size=xi_feat_size,
             )
         reward_mlp_shape = (255,) if config.reward_head == "symlog_disc" else []
         self.heads["reward"] = networks.MLP(
@@ -143,6 +187,92 @@ class WorldModel(nn.Module):
         )
         self._scales = dict(reward=config.reward_scale, cont=config.cont_scale)
 
+        # Diagnostic probes. Built after _model_opt so they are not among its
+        # parameters, and trained on detached features by their own optimizer, so
+        # they read the state without shaping it.
+        self.probes = nn.ModuleDict()
+        if config.probe_state:
+            stoch_size = (config.dyn_stoch * config.dyn_discrete
+                          if config.dyn_discrete else config.dyn_stoch)
+            targets = {"taskid": config.task_train_size}
+            # arm is bandits-specific: optimal_arm = task_id % num_arms.
+            if getattr(config, "num_arms", 0):
+                targets["arm"] = config.num_arms
+            for part, size in (("deter", config.dyn_deter), ("stoch", stoch_size)):
+                for target, classes in targets.items():
+                    self.probes[f"{part}_{target}"] = nn.Linear(size, classes)
+            self.probes.to(config.device)
+            self._probe_opt = torch.optim.Adam(self.probes.parameters(), lr=3e-4)
+
+    def _probe_metrics(self, post, data):
+        """Linear-probe accuracy from detached state parts to task id and arm.
+
+        Early steps are the informative ones: before exploration the arm is only
+        knowable from the distractor, so high early accuracy is the shortcut.
+        """
+        deter = post["deter"].detach()
+        stoch = post["stoch"].detach()
+        stoch = stoch.reshape(*stoch.shape[:2], -1)
+        task = data["task_id"].long()
+        valid = (task >= 0) & (task < self._config.task_train_size)
+        if not torch.any(valid):
+            return {}
+        early = max(1, self._config.probe_early_steps)
+        labels = {"taskid": task}
+        if getattr(self._config, "num_arms", 0):
+            labels["arm"] = task % self._config.num_arms
+
+        metrics, loss = {}, 0.0
+        # RequiresGrad(self) clears requires_grad on the whole world model on exit,
+        # probes included, so re-enable them here. Inputs stay detached either way.
+        self.probes.requires_grad_(True)
+        with torch.enable_grad():
+            for part, feat in (("deter", deter), ("stoch", stoch)):
+                for target, label in labels.items():
+                    logits = self.probes[f"{part}_{target}"](feat)
+                    loss = loss + torch.nn.functional.cross_entropy(
+                        logits[valid], label[valid]
+                    )
+                    with torch.no_grad():
+                        correct = (logits.argmax(-1) == label) & valid
+                        for span, sl in (("early", slice(0, early)),
+                                         ("late", slice(early, None))):
+                            v = valid[:, sl]
+                            if torch.any(v):
+                                metrics[f"probe/{part}_{target}_{span}_acc"] = to_np(
+                                    correct[:, sl].sum() / v.sum())
+        self._probe_opt.zero_grad()
+        loss.backward()
+        self._probe_opt.step()
+        metrics["probe/chance_taskid"] = 1.0 / self._config.task_train_size
+        if getattr(self._config, "num_arms", 0):
+            metrics["probe/chance_arm"] = 1.0 / self._config.num_arms
+        return metrics
+
+    def _context_loss(self, xi_post, data):
+        """Cross-entropy from xi_deter to the task id, over labelled steps only."""
+        n = self._config.task_train_size
+        target = data["task_id"].long()
+        valid = (target >= 0) & (target < n)
+        if not torch.any(valid):
+            return torch.zeros((), device=self._config.device)
+        logits = self.xi_dynamics.context_logits(xi_post)
+        return torch.nn.functional.cross_entropy(
+            logits[valid], target[valid]
+        )
+
+    def xi_embed(self, data, embed):
+        """Embedding for the exogenous stream: its own reward-free one, or shared."""
+        return self.xi_encoder(data) if self.xi_encoder is not None else embed
+
+    def get_xi_feat(self, xi_state):
+        """The exogenous feature the decoder branch reads."""
+        if xi_state is None:
+            return None
+        if self._config.xi_head_input == "feat":
+            return self.xi_dynamics.get_feat(xi_state)
+        return xi_state["deter"]
+
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
@@ -170,14 +300,41 @@ class WorldModel(nn.Module):
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
 
+                # Exogenous stream: no action input, and no reward when xi_no_reward.
+                xi_post, xi_prior, xi_kl_loss = None, None, 0.0
+                if self._use_exo:
+                    xi_rssm_time = time.time()
+                    xi_post, xi_prior = self.xi_dynamics.observe(
+                        self.xi_embed(data, embed), data["is_first"]
+                    )
+                    self._add_wm_timing(time_metrics, 'xi_rssm', time.time() - xi_rssm_time)
+                    xi_kl_loss, xi_kl_value, xi_dyn_loss, xi_rep_loss = (
+                        self.xi_dynamics.kl_loss(
+                            xi_post,
+                            xi_prior,
+                            self._config.xi_kl_free,
+                            self._config.xi_dyn_scale,
+                            self._config.xi_rep_scale,
+                        )
+                    )
+                    xi_kl_loss = self._config.xi_kl_scale * xi_kl_loss
+                    if self._config.xi_ctx_scale > 0:
+                        xi_ctx_loss = self._context_loss(xi_post, data)
+                        xi_kl_loss = xi_kl_loss + self._config.xi_ctx_scale * xi_ctx_loss
+
                 get_features_time = time.time()
                 feat = self.dynamics.get_feat(post)
+                xi_feat = self.get_xi_feat(xi_post)
                 self._add_wm_timing(time_metrics, 'get_features', time.time() - get_features_time)
 
-                losses, mses = self._compute_prediction_losses(feat, embed, data, time_metrics)
+                losses, mses = self._compute_prediction_losses(
+                    feat, embed, data, time_metrics, xi_feat
+                )
 
             optimizer_time = time.time()
-            metrics = self._model_opt(sum(losses.values()) + kl_loss, self.parameters())
+            metrics = self._model_opt(
+                sum(losses.values()) + kl_loss + xi_kl_loss, self.parameters()
+            )
             self._add_wm_timing(time_metrics, 'optimizer', time.time() - optimizer_time)
             self._add_wm_timing(time_metrics, 'total', time.time() - data_preprocess_time, use_counter=False)
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
@@ -187,6 +344,13 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
+        if self._use_exo:
+            metrics["xi_kl_loss"] = to_np(xi_kl_loss)
+            metrics["xi_dyn_loss"] = to_np(xi_dyn_loss)
+            metrics["xi_rep_loss"] = to_np(xi_rep_loss)
+            metrics["xi_kl"] = to_np(torch.mean(xi_kl_value))
+            if self._config.xi_ctx_scale > 0:
+                metrics["xi_ctx_loss"] = to_np(xi_ctx_loss)
         for name, mse in mses.items():
             metrics[f"{name}_mse"] = to_np(mse)
         metrics.update(time_metrics)
@@ -195,13 +359,26 @@ class WorldModel(nn.Module):
             post_ent = self.dynamics.get_dist(post).entropy()
             metrics["prior_ent"] = to_np(torch.mean(prior_ent))
             metrics["post_ent"] = to_np(torch.mean(post_ent))
+            if self._use_exo:
+                metrics["xi_prior_ent"] = to_np(
+                    torch.mean(self.xi_dynamics.get_dist(xi_prior).entropy())
+                )
+                metrics["xi_post_ent"] = to_np(
+                    torch.mean(self.xi_dynamics.get_dist(xi_post).entropy())
+                )
             context = dict(
                 embed=embed,
                 feat=feat,
                 kl=kl_value,
                 postent=post_ent,
             )
+            # xi rides in context, deliberately not in post: post becomes `start` for
+            # ImagBehavior, and imagination must stay endogenous-only.
+            if self._use_exo:
+                context["xi_post"] = {k: v.detach() for k, v in xi_post.items()}
         post = {k: v.detach() for k, v in post.items()}
+        if self._config.probe_state and "task_id" in data:
+            metrics.update(self._probe_metrics(post, data))
         return post, context, metrics
 
     @staticmethod
@@ -218,7 +395,7 @@ class WorldModel(nn.Module):
         max_pair = logits_pairs_mean.max(dim=-1)[0]
         return (logits_pairs_mean.sum(dim=-1) - max_pair).unsqueeze(-1)
 
-    def _compute_prediction_losses(self, feat, embed, data, time_metrics):
+    def _compute_prediction_losses(self, feat, embed, data, time_metrics, xi_feat=None):
         preds = {}
         sequence_indices = None
 
@@ -234,6 +411,10 @@ class WorldModel(nn.Module):
             ) for _ in range(batch_size)]).reshape(batch_size, self._config.hidden_states_subsample)
             batch_indices = np.arange(batch_size)[:, np.newaxis]
             feat = feat[batch_indices, sequence_indices]
+            # Same indices, or xi desynchronizes from the endogenous state it is
+            # being added to.
+            if xi_feat is not None:
+                xi_feat = xi_feat[batch_indices, sequence_indices]
 
         self._add_wm_timing(time_metrics, 'sample_features', time.time() - sample_features_time)
 
@@ -247,10 +428,26 @@ class WorldModel(nn.Module):
         for name, head in self.heads.items():
             grad_head = name in self._config.grad_heads
             curr_feat = feat if grad_head else feat.detach()
+            # Only the decoder heads get the exogenous branch; reward and cont are
+            # endogenous by design.
+            is_decoder = name in ("decoder", "multi_decoder")
+            curr_xi = None
+            if xi_feat is not None and is_decoder:
+                curr_xi = xi_feat if grad_head else xi_feat.detach()
             if "multi" in name:
                 feat_repeat = curr_feat.repeat(1, self._config.reconstruction_window, 1)
                 feat_and_embed_input = torch.cat([feat_repeat, windowed_embed], dim=-1)
-                pred = head(feat_and_embed_input)
+                if curr_xi is not None:
+                    # Repeat xi the same way, so each repeated feature keeps its own
+                    # exogenous state.
+                    pred = head(
+                        feat_and_embed_input,
+                        curr_xi.repeat(1, self._config.reconstruction_window, 1),
+                    )
+                else:
+                    pred = head(feat_and_embed_input)
+            elif curr_xi is not None:
+                pred = head(curr_feat, curr_xi)
             else:
                 pred = head(curr_feat)
 
@@ -315,31 +512,65 @@ class WorldModel(nn.Module):
         if "time_step" in obs:
             obs["time_step"] = torch.Tensor(obs["time_step"]).unsqueeze(-1)
 
+        task_id = obs.pop("task_id", None)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
+        if task_id is not None:
+            obs["task_id"] = torch.as_tensor(
+                np.asarray(task_id), dtype=torch.long, device=self._config.device
+            )
         return obs
 
-    def video_pred(self, data):
+    def _rollout_for_logging(self, data, batch=6, context=5):
+        """Posterior over the first `context` steps, then open-loop imagination.
+
+        Returns (data, recon, openl) where recon and openl are each the
+        (combined, endo_only, exo_only) triple from the decoder. The endogenous half
+        is rolled with actions; the exogenous half is action-free.
+        """
         data = self.preprocess(data)
         embed = self.encoder(data)
 
         states, _ = self.dynamics.observe(
-            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
+            embed[:batch, :context],
+            data["action"][:batch, :context],
+            data["is_first"][:batch, :context],
         )
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
-                :6
-                ]
-        reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.dynamics.imagine(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
-        reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
-        # observed image is given until 5 steps
-        model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:6] + 0.5
-        model = model + 0.5
-        error = (model - truth + 1.0) / 2.0
+        prior = self.dynamics.imagine(data["action"][:batch, context:], init)
 
-        return torch.cat([truth, model, error], 2)
+        xi_post_feat, xi_prior_feat = None, None
+        if self._use_exo:
+            xi_states, _ = self.xi_dynamics.observe(
+                self.xi_embed(data, embed)[:batch, :context],
+                data["is_first"][:batch, :context],
+            )
+            xi_init = {k: v[:, -1] for k, v in xi_states.items()}
+            horizon = data["action"][:batch, context:].shape[1]
+            xi_post_feat = self.get_xi_feat(xi_states)
+            xi_prior_feat = self.get_xi_feat(self.xi_dynamics.imagine(horizon, xi_init))
+
+        decode = self.heads["decoder"].forward_parts
+        recon = decode(self.dynamics.get_feat(states), xi_post_feat)
+        openl = decode(self.dynamics.get_feat(prior), xi_prior_feat)
+        return data, recon, openl
+
+    def video_pred(self, data):
+        data, recon, openl = self._rollout_for_logging(data)
+        truth = data["image"][:6] + 0.5
+
+        def stitch(recon_dists, openl_dists):
+            """Observed segment followed by the open-loop one."""
+            observed = recon_dists["image"].mode()[:6][:, :5]
+            return torch.cat([observed, openl_dists["image"].mode()], 1) + 0.5
+
+        model = stitch(recon[0], openl[0])
+        rows = [truth, model]
+        if self._use_exo:
+            # The same sequence decoded from each stream alone.
+            rows.append(stitch(recon[1], openl[1]))
+            rows.append(stitch(recon[2], openl[2]))
+        rows.append((model - truth + 1.0) / 2.0)
+        return torch.cat(rows, 2)
 
 
 class ImagBehavior(nn.Module):
@@ -477,7 +708,13 @@ class ImagBehavior(nn.Module):
         return imag_feat, imag_state, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):
+        # Endogenous only, by construction: `dynamics` is the endogenous RSSM and
+        # `start` is its posterior. The exogenous state is never imagined and the
+        # policy never sees it, so the actor's feature stays the endogenous feature.
         dynamics = self._world_model.dynamics
+        assert not any(k.startswith("xi_") for k in start), (
+            "exogenous state leaked into the imagination start state", list(start)
+        )
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
         start = {k: flatten(v) for k, v in start.items()}
 

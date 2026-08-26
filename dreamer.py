@@ -267,7 +267,7 @@ def make_env(config, mode, pool=None):
             }[mode]()
         env = bandits.BanditEnv(generator, num_steps=config.max_episode_length,
                                 allowed_ids=allowed_ids,
-                                no_distractor=config.no_distractor)
+                                use_distractor=config.use_distractor)
         env = wrappers.OneHotAction(env)
     elif suite == "dmc":
         import envs.dmc as dmc
@@ -418,6 +418,7 @@ def main(config):
             val_size=config.task_val_size,
             test_size=config.task_test_size,
             seed=config.task_split_seed,
+            contiguous=config.task_split_contiguous,
         )
         described = task_split.describe_pool(pool)
         print(f"Task split: {described}")
