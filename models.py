@@ -204,6 +204,51 @@ class WorldModel(nn.Module):
             self.probes.to(config.device)
             self._probe_opt = torch.optim.Adam(self.probes.parameters(), lr=3e-4)
 
+        # CLUB. Built after _model_opt for the same reason as the probes: the
+        # approximator is fit by its own optimizer and must not be a world-model
+        # parameter, or the model would learn to make q bad instead of making the
+        # streams independent.
+        self._club = None
+        if self._use_exo and config.club_scale > 0:
+            z_stoch = (config.dyn_stoch * config.dyn_discrete
+                       if config.dyn_discrete else config.dyn_stoch)
+            xi_stoch = (config.xi_stoch * config.xi_discrete
+                        if config.xi_discrete else config.xi_stoch)
+            # 'logit' has the same flattened width as 'stoch' -- it is the logits
+            # over the same categorical, before sampling.
+            club_z_size = {
+                "feat": config.dyn_deter + z_stoch,
+                "deter": config.dyn_deter,
+                "stoch": z_stoch,
+                "logit": z_stoch,
+            }[config.club_input]
+            club_xi_size = {
+                "feat": config.xi_deter + xi_stoch,
+                "deter": config.xi_deter,
+                "stoch": xi_stoch,
+                "logit": xi_stoch,
+            }[config.club_input]
+            if config.club_input == "logit" and not (
+                config.dyn_discrete and config.xi_discrete
+            ):
+                raise ValueError(
+                    "club_input='logit' needs dyn_discrete and xi_discrete; "
+                    "continuous RSSMs carry 'mean'/'std', not 'logit'."
+                )
+            self._club = networks.CLUB(
+                club_z_size,
+                club_xi_size,
+                config.club_hidden,
+                config.club_layers,
+                config.act,
+                config.norm,
+                config.club_normalize_xi,
+                config.club_norm_momentum,
+            ).to(config.device)
+            self._club_opt = torch.optim.Adam(
+                self._club.parameters(), lr=config.club_lr
+            )
+
     def _probe_metrics(self, post, data):
         """Linear-probe accuracy from detached state parts to task id and arm.
 
@@ -273,6 +318,44 @@ class WorldModel(nn.Module):
             return self.xi_dynamics.get_feat(xi_state)
         return xi_state["deter"]
 
+    def _club_inputs(self, post, feat, xi_post, xi_feat):
+        """The slice of each stream the CLUB bound is taken over.
+
+        Built from the state dicts rather than by slicing `feat`, so it does not
+        depend on how get_feat happens to order deter and stoch.
+        """
+        mode = self._config.club_input
+        if mode == "feat":
+            return feat, xi_feat
+        if mode == "deter":
+            return post["deter"], xi_post["deter"]
+        # 'stoch' is one straight-through sample, so the estimate carries the
+        # sampling noise; 'logit' is the distribution it was drawn from, which is
+        # continuous and unsampled -- a better match for the Gaussian q, and it
+        # does not jitter step to step. Both flatten the discrete groups.
+        key = "logit" if mode == "logit" else "stoch"
+        z, x = post[key], xi_post[key]
+        return z.reshape(*z.shape[:2], -1), x.reshape(*x.shape[:2], -1)
+
+    def _club_learn(self, feat, xi_feat):
+        """Fit the CLUB approximator q(xi|z). Returns its NLL for logging.
+
+        Inputs are detached inside `learning_loss`, and RequiresGrad(self) has
+        cleared requires_grad across the world model -- the CLUB net is not a
+        world-model parameter, but re-enable it here for the same reason the probes
+        do, since it is reached through this module.
+        """
+        self._club.requires_grad_(True)
+        feat, xi_feat = feat.detach(), xi_feat.detach()
+        with torch.enable_grad():
+            for _ in range(max(1, self._config.club_inner_steps)):
+                nll = self._club.learning_loss(feat, xi_feat)
+                # feat/xi_feat carry no grad here, so this backward touches only q.
+                self._club_opt.zero_grad()
+                nll.backward()
+                self._club_opt.step()
+        return nll.detach()
+
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
@@ -327,14 +410,38 @@ class WorldModel(nn.Module):
                 xi_feat = self.get_xi_feat(xi_post)
                 self._add_wm_timing(time_metrics, 'get_features', time.time() - get_features_time)
 
+                # CLUB, before the prediction losses because they may subsample feat.
+                club_loss = 0.0
+                if self._club is not None:
+                    club_time = time.time()
+                    club_z, club_xi = self._club_inputs(
+                        post, feat, xi_post, xi_feat
+                    )
+                    club_mi = self._club.mi_est(club_z, club_xi)
+                    # I(z; xi) >= 0 always, so a negative bound means q has not fit
+                    # p(xi|z) and the estimate is an artifact, not a measurement.
+                    # Clamping kills the gradient in that regime rather than letting
+                    # the world model descend on it. club_mi is still logged raw --
+                    # a clamped-to-zero club_loss with a negative club_mi is the
+                    # signal that q is behind, so read both.
+                    club_loss = self._config.club_scale * club_mi.clamp(min=0.0)
+                    self._add_wm_timing(time_metrics, 'club', time.time() - club_time)
+
                 losses, mses = self._compute_prediction_losses(
                     feat, embed, data, time_metrics, xi_feat
                 )
 
             optimizer_time = time.time()
             metrics = self._model_opt(
-                sum(losses.values()) + kl_loss + xi_kl_loss, self.parameters()
+                sum(losses.values()) + kl_loss + xi_kl_loss + club_loss,
+                self.parameters(),
             )
+            if self._club is not None:
+                # Fit q(xi|z) on detached features, by its own optimizer, *after*
+                # the world-model step: the bound above holds the CLUB weights in
+                # its graph, and stepping them first is an in-place modification
+                # that breaks that backward pass.
+                club_nll = self._club_learn(club_z, club_xi)
             self._add_wm_timing(time_metrics, 'optimizer', time.time() - optimizer_time)
             self._add_wm_timing(time_metrics, 'total', time.time() - data_preprocess_time, use_counter=False)
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
@@ -351,6 +458,20 @@ class WorldModel(nn.Module):
             metrics["xi_kl"] = to_np(torch.mean(xi_kl_value))
             if self._config.xi_ctx_scale > 0:
                 metrics["xi_ctx_loss"] = to_np(xi_ctx_loss)
+            if self._club is not None:
+                # club_mi is the bound on I(z; xi) in nats; club_nll says whether q
+                # has fit well enough for that bound to mean anything.
+                metrics["club_mi"] = to_np(club_mi)
+                metrics["club_loss"] = to_np(club_loss)
+                metrics["club_nll"] = to_np(club_nll)
+                # Whether q's Gaussian is straining against its targets. See
+                # CLUB.logvar_stats.
+                for k, v in self._club.logvar_stats(club_z).items():
+                    metrics[f"club_{k}"] = to_np(v)
+                # Is the bound's gradient noise-dominated, and is it a small
+                # residual of two large terms? See CLUB.mi_stats.
+                for k, v in self._club.mi_stats(club_z, club_xi).items():
+                    metrics[f"club_{k}"] = to_np(v)
         for name, mse in mses.items():
             metrics[f"{name}_mse"] = to_np(mse)
         metrics.update(time_metrics)

@@ -626,6 +626,188 @@ class XiRSSM(nn.Module):
         return loss, value, dyn_loss, rep_loss
 
 
+class CLUB(nn.Module):
+    """Contrastive Log-ratio Upper Bound on I(z; xi)  (Cheng et al., 2020).
+
+    A variational net q(xi | z) = N(mu(z), sigma(z)^2) gives
+
+        I(z; xi) <= E_i[log q(xi_i|z_i)] - E_{i,j}[log q(xi_j|z_i)]
+
+    which is a valid upper bound only when q has actually fit p(xi|z). So the
+    module is used in two alternating passes:
+
+    - `learning_loss(z, xi)`: -log q(xi|z) on *detached* inputs, stepped by its own
+      optimizer. Fits the approximator; never touches world-model gradients.
+    - `mi_est(z, xi)`: the bound itself, added to the world-model loss so that
+      minimizing it pushes the endogenous and exogenous streams apart.
+
+    Inputs are flattened over batch and time, so the negative pairs (i, j) mix
+    across both -- the "wrong" xi for a given z is usually a different task.
+    """
+
+    def __init__(self, z_dim, xi_dim, hidden=256, layers=2, act="SiLU", norm="LayerNorm",
+                 normalize_xi=True, norm_momentum=0.99):
+        super(CLUB, self).__init__()
+        act = getattr(torch.nn, act)
+        norm = getattr(torch.nn, norm)
+
+        def trunk(out_dim, tail):
+            mods, inp = [], z_dim
+            for _ in range(layers):
+                mods += [nn.Linear(inp, hidden, bias=False), norm(hidden, eps=1e-03), act()]
+                inp = hidden
+            mods += [nn.Linear(inp, out_dim)] + tail
+            net = nn.Sequential(*mods)
+            net.apply(tools.weight_init)
+            return net
+
+        self._mu = trunk(xi_dim, [])
+        # Tanh-bounded logvar: an unbounded one lets q shrink its variance without
+        # limit, and the bound blows up on the negative pairs.
+        self._logvar = trunk(xi_dim, [nn.Tanh()])
+
+        # Running standardizer for xi. The logvar head is bounded to [-1, 1], so q
+        # can only express variances in [e^-1, e^1]. When xi's own per-dimension
+        # scale sits far below that, q pins every dimension at the floor and the
+        # squared errors are inflated by 1/var -- which is what makes |pos| and
+        # |neg| both large while their difference (the actual bound) stays small.
+        # Standardizing xi puts its scale inside the range q can represent, so the
+        # floor stops binding.
+        #
+        # Buffers, not parameters: these are updated from data under no_grad, never
+        # by the optimizer. Registered so they survive checkpoint save/load -- the
+        # normalization must be identical when a run resumes.
+        self._normalize_xi = normalize_xi
+        self._norm_momentum = norm_momentum
+        self.register_buffer("_xi_mean", torch.zeros(xi_dim))
+        self.register_buffer("_xi_var", torch.ones(xi_dim))
+        self.register_buffer("_norm_inited", torch.zeros((), dtype=torch.bool))
+
+    @torch.no_grad()
+    def _update_norm(self, xi):
+        """Refresh the running xi statistics. Call once per step, on flat xi."""
+        mean, var = xi.mean(0), xi.var(0, unbiased=False)
+        if not bool(self._norm_inited):
+            # Seed from the first batch rather than crawling up from (0, 1), which
+            # would leave the scale wrong for the first few hundred steps.
+            self._xi_mean.copy_(mean)
+            self._xi_var.copy_(var)
+            self._norm_inited.fill_(True)
+        else:
+            m = self._norm_momentum
+            self._xi_mean.mul_(m).add_(mean, alpha=1 - m)
+            self._xi_var.mul_(m).add_(var, alpha=1 - m)
+
+    def _normalize(self, xi):
+        """Apply the running standardization to xi.
+
+        The statistics are buffers updated under no_grad, so this is a fixed affine
+        map at each step: gradients reach xi itself but never flow through the
+        mean/std. Normalizing with in-graph batch statistics would both reroute
+        world-model gradients through them and give q a target that rescales every
+        step.
+        """
+        if not self._normalize_xi:
+            return xi
+        return (xi - self._xi_mean) * torch.rsqrt(self._xi_var + 1e-8)
+
+    def _stats(self, z):
+        return self._mu(z), self._logvar(z)
+
+    @staticmethod
+    def _flat(x):
+        return x.reshape(-1, x.shape[-1])
+
+    @torch.no_grad()
+    def logvar_stats(self, z):
+        """Diagnostics on q's predicted log-variance.
+
+        The logvar head is tanh-bounded to [-1, 1]. A mean pinned near -1, or a
+        large `frac_floor`, means q is driving its variance to the floor -- what
+        a Gaussian does when asked to model near-deterministic targets such as
+        one-hot samples. That is the signature of a misspecified q: the fit can
+        still look converged while the bound it supports is loose.
+        """
+        lv = self._logvar(self._flat(z).detach())
+        return {
+            "logvar_mean": lv.mean(),
+            "logvar_min": lv.min(),
+            "logvar_frac_floor": (lv < -0.95).float().mean(),
+        }
+
+    @torch.no_grad()
+    def mi_stats(self, z, xi):
+        """Decomposition of the bound, for telling variance from cancellation.
+
+        `mi_est` returns only the mean of (pos - neg). Two different pathologies
+        produce a noisy gradient from it, and they need different fixes:
+
+        - High variance: the per-sample spread of (pos - neg) is large relative
+          to its mean. The distractor is constant within an episode, so the
+          negative average has an effective sample size of roughly the number of
+          episodes in the batch, not the number of flattened rows.
+        - Catastrophic cancellation: `pos` and `neg` are both large and nearly
+          equal while their difference is small, so the relative error in the
+          difference is far larger than in either term -- and it worsens as the
+          bound approaches zero, i.e. as training succeeds.
+
+        `diff_std` is the spread across samples within one batch, not across
+        training steps; `diff_snr` is |mean| / std, so small means noise-dominated.
+        """
+        z, xi = self._flat(z), self._flat(xi)
+        xi = self._normalize(xi)
+        mu, logvar = self._stats(z)
+        var = logvar.exp()
+        pos = -((mu - xi) ** 2 / var).sum(-1) / 2
+        neg = -(
+            (mu.unsqueeze(1) - xi.unsqueeze(0)) ** 2 / var.unsqueeze(1)
+        ).sum(-1).mean(1) / 2
+        diff = pos - neg
+        std = diff.std()
+        return {
+            "pos_mean": pos.mean(),
+            "neg_mean": neg.mean(),
+            "diff_std": std,
+            # Guarded so an exactly-constant diff logs 0 rather than inf/nan.
+            "diff_snr": diff.mean().abs() / std.clamp(min=1e-8),
+            # Scale of the terms being differenced. If |pos| >> |diff|, the bound
+            # is a small residual of large numbers.
+            "pos_abs_mean": pos.abs().mean(),
+        }
+
+    def learning_loss(self, z, xi):
+        """Negative log-likelihood of q(xi|z). Detached: fits q only."""
+        z, xi = self._flat(z).detach(), self._flat(xi).detach()
+        # The single per-step update of the running statistics. This runs after
+        # mi_est in the training loop, so the bound and the fit both use the same
+        # (previous-step) statistics -- q is never asked to chase a target that was
+        # rescaled after the bound that shaped it was taken.
+        if self._normalize_xi:
+            self._update_norm(xi)
+        xi = self._normalize(xi)
+        mu, logvar = self._stats(z)
+        return ((mu - xi) ** 2 / logvar.exp() + logvar).sum(-1).mean() / 2
+
+    def mi_est(self, z, xi):
+        """The CLUB upper bound on I(z; xi). Gradients flow to z and xi."""
+        z, xi = self._flat(z), self._flat(xi)
+        # Fixed affine map (buffers), so gradients still reach xi. MI is invariant
+        # under an invertible transform of either argument, so the bound is on the
+        # same quantity as before -- only its conditioning changes.
+        xi = self._normalize(xi)
+        mu, logvar = self._stats(z)
+        # Positive pairs: each z with its own xi.
+        pos = -((mu - xi) ** 2 / logvar.exp()).sum(-1) / 2
+        # Negative pairs: every z against every xi in the batch, averaged over j.
+        # (n, 1, d) vs (1, n, d) -> (n, n); the mean over dim 1 is E_j.
+        neg = -(
+            (mu.unsqueeze(1) - xi.unsqueeze(0)) ** 2 / logvar.exp().unsqueeze(1)
+        ).sum(-1).mean(1) / 2
+        # The log-variance term is identical in pos and neg and cancels, so it is
+        # dropped from both above.
+        return (pos - neg).mean()
+
+
 class MultiEncoder(nn.Module):
     def __init__(
         self,

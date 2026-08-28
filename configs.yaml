@@ -15,7 +15,7 @@ defaults:
   reset_every: 0
   device: 'cuda:0'
   compile: True
-  precision: 16
+  precision: 32
   debug: False
   expl_gifs: False
   video_pred_log: False
@@ -88,6 +88,38 @@ defaults:
   xi_ctx_scale: 1.0
   # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
   xi_head_input: 'feat'
+
+  # CLUB: a variational upper bound on I(endogenous feat; xi feat), added to the
+  # world-model loss to drive the two streams apart. Needs use_exo. The approximator
+  # q(xi|z) is fit by its own optimizer on detached features, so it never shapes the
+  # world model except through the bound. 0 disables it.
+  club_scale: 0.0
+  club_hidden: 256
+  club_layers: 2
+  club_lr: 3e-4
+  # Which part of each stream the bound is taken over: 'feat' (deter ++ stoch),
+  # 'deter', 'stoch', or 'logit'. Applied to both streams, and independent of
+  # xi_head_input, which controls what the *decoder* branch reads.
+  # 'logit' is the categorical's parameters rather than a draw from it: same
+  # width as 'stoch', but continuous and free of per-step sampling noise, so the
+  # diagonal-Gaussian q is much better specified. Needs discrete latents.
+  # 'stoch' keeps the pressure off the recurrent state, where the within-episode
+  # explore/exploit history lives -- penalizing MI there can strip the arm-relevant
+  # history the policy needs, since distractor and arm are correlated on train tasks.
+  # Note 'feat'/'stoch' feed a flattened one-hot categorical to a diagonal-Gaussian
+  # q, which is misspecified and inflates the magnitude of club_nll.
+  club_input: 'feat'
+  # Standardize xi (running mean/var, no_grad buffers) before the bound. The logvar
+  # head is tanh-bounded to [-1, 1], so q can only express variances in [e^-1, e^1];
+  # when xi's own scale falls below that, q pins every dim at the floor and the 1/var
+  # factor inflates both terms of the bound while their difference stays small --
+  # club_diff_snr ~0.015 with club_logvar_frac_floor 0.96 is that failure. False
+  # restores the pre-normalization behaviour of runs up to #11.
+  club_normalize_xi: True
+  club_norm_momentum: 0.99
+  # Approximator steps per world-model step. The bound is only valid once q has
+  # fit p(xi|z), so q should stay ahead of the streams it is measuring.
+  club_inner_steps: 1
 
   # Detached linear probes from deter/stoch to task id and optimal arm. Diagnostic
   # only: they never affect the world model. Needs labelled task_ids.
@@ -346,7 +378,8 @@ bandits:
   actor_lr: 3e-04
   model_lr: 1e-3
   value_lr: 3e-04
-
+  actor_entropy: '1e-3'
+  discount: 0.99
 # Same as `bandits` but the distractor drifts within the episode, so it is harder
 # to bind to a single optimal arm. Run as: --configs bandits bandits_drift
 bandits_drift:
