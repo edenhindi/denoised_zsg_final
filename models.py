@@ -5,6 +5,7 @@ import torch
 from torch import nn
 import numpy as np
 
+import mi_estimators
 import networks
 import tools
 
@@ -249,6 +250,65 @@ class WorldModel(nn.Module):
                 self._club.parameters(), lr=config.club_lr
             )
 
+        # Action-MI terms: MINE on I((e, s, s'); a) and CLUB on I((e, xi, xi'); a),
+        # where e is a fixed one-hot of the task id. Nothing here is a world-model
+        # parameter: the one-hot is constant, and the estimator nets are fit by
+        # their own optimizers for the same reason as the CLUB above.
+        #
+        # A one-hot rather than a learned nn.Embedding because a learned table
+        # takes gradients from these same objectives, so it can make them easier to
+        # satisfy by reshaping the task code instead of by changing the streams --
+        # the estimate then moves for a reason that has nothing to do with the
+        # world model. The per-task weights in each estimator's first layer still
+        # give it whatever task-specific capacity it needs.
+        self._act_mine = None
+        self._act_club = None
+        want_mine = config.act_mine_scale > 0
+        want_act_club = config.act_club_scale > 0 and self._use_exo
+        if want_mine or want_act_club:
+            task_code_size = config.task_train_size
+            feat_size = config.dyn_deter + (
+                config.dyn_stoch * config.dyn_discrete
+                if config.dyn_discrete
+                else config.dyn_stoch
+            )
+            xi_stoch = (
+                config.xi_stoch * config.xi_discrete
+                if config.xi_discrete
+                else config.xi_stoch
+            )
+            xi_feat_size = (
+                config.xi_deter + xi_stoch
+                if config.xi_head_input == "feat"
+                else config.xi_deter
+            )
+            if want_mine:
+                self._act_mine = mi_estimators.MINE(
+                    task_code_size + 2 * feat_size,
+                    config.num_actions,
+                    config.act_mi_hidden,
+                    config.act_mi_layers,
+                    config.act,
+                    config.norm,
+                    ema_decay=config.act_mine_ema_decay,
+                    clip=config.act_mine_clip,
+                ).to(config.device)
+                self._act_mine_opt = torch.optim.Adam(
+                    self._act_mine.parameters(), lr=config.act_mi_lr
+                )
+            if want_act_club:
+                self._act_club = mi_estimators.CLUB(
+                    task_code_size + 2 * xi_feat_size,
+                    config.num_actions,
+                    config.act_mi_hidden,
+                    config.act_mi_layers,
+                    config.act,
+                    config.norm,
+                ).to(config.device)
+                self._act_club_opt = torch.optim.Adam(
+                    self._act_club.parameters(), lr=config.act_mi_lr
+                )
+
     def _probe_metrics(self, post, data):
         """Linear-probe accuracy from detached state parts to task id and arm.
 
@@ -356,6 +416,53 @@ class WorldModel(nn.Module):
                 self._club_opt.step()
         return nll.detach()
 
+    def _act_mi_inputs(self, stream_feat, data):
+        """Build ((task_onehot, s, s'), a) for the action-MI terms.
+
+        Returns (x, y) already flattened to (N, dim), or None when no step in the
+        batch carries a usable label. `stream_feat` is the endogenous or exogenous
+        feature; the pairing and masking are identical for both.
+
+        s' is the next observed step, so the last timestep has no successor and is
+        dropped. Steps whose task_id falls outside the train split are dropped too:
+        the one-hot has one column per train task, and an unlabelled step (-1)
+        would set the wrong column rather than error.
+        """
+        n = self._config.task_train_size
+        task = data["task_id"].long()
+        # A step is usable if it is labelled *and* its successor exists.
+        valid = ((task >= 0) & (task < n))[:, :-1]
+        if not torch.any(valid):
+            return None
+        # Clamp before the one-hot: invalid rows are masked out immediately after,
+        # but the index itself must be in range or the scatter faults.
+        e = torch.nn.functional.one_hot(
+            task[:, :-1].clamp(0, n - 1), n
+        ).to(stream_feat.dtype)
+        x = torch.cat([e, stream_feat[:, :-1], stream_feat[:, 1:]], -1)
+        y = data["action"][:, :-1]
+        # Masking after the concat keeps the pairing intact: flattening first and
+        # then selecting would let a dropped row's successor pair with the wrong
+        # step. The result is a flat (N, dim) with only usable rows.
+        return x[valid], y[valid]
+
+    def _act_mi_learn(self, estimator, opt, x, y):
+        """Fit one action-MI estimator on detached inputs. Returns its loss.
+
+        Same contract as `_club_learn`: the estimator is not a world-model
+        parameter, but it is reached through this module, so RequiresGrad(self) has
+        cleared its requires_grad on the way in.
+        """
+        estimator.requires_grad_(True)
+        x, y = x.detach(), y.detach()
+        with torch.enable_grad():
+            for _ in range(max(1, self._config.act_mi_inner_steps)):
+                loss = estimator.learning_loss(x, y)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        return loss.detach()
+
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
@@ -427,15 +534,63 @@ class WorldModel(nn.Module):
                     club_loss = self._config.club_scale * club_mi.clamp(min=0.0)
                     self._add_wm_timing(time_metrics, 'club', time.time() - club_time)
 
+                # Action-MI terms, on the same features and before the prediction
+                # losses for the same reason as the CLUB above.
+                act_mi_loss = 0.0
+                mine_pair, act_club_pair = None, None
+                mine_mi, act_club_mi = None, None
+                if self._act_mine is not None or self._act_club is not None:
+                    act_mi_time = time.time()
+                    if self._act_mine is not None:
+                        mine_pair = self._act_mi_inputs(feat, data)
+                        if mine_pair is not None:
+                            mine_mi = self._act_mine.mi_est(*mine_pair)
+                            # Maximized, so it enters negated. No clamp: MINE is a
+                            # lower bound, and a negative value means the critic has
+                            # not fit rather than that the quantity is negative --
+                            # clamping there would silently kill the gradient in
+                            # exactly the regime the term is meant to escape.
+                            act_mi_loss = (
+                                act_mi_loss - self._config.act_mine_scale * mine_mi
+                            )
+                    if self._act_club is not None:
+                        act_club_pair = self._act_mi_inputs(xi_feat, data)
+                        if act_club_pair is not None:
+                            act_club_mi = self._act_club.mi_est(*act_club_pair)
+                            # Minimized, and clamped for the same reason as the
+                            # I(z; xi) bound: I >= 0, so a negative estimate is an
+                            # unfit q rather than a measurement.
+                            act_mi_loss = (
+                                act_mi_loss
+                                + self._config.act_club_scale
+                                * act_club_mi.clamp(min=0.0)
+                            )
+                    self._add_wm_timing(
+                        time_metrics, 'act_mi', time.time() - act_mi_time
+                    )
+
                 losses, mses = self._compute_prediction_losses(
                     feat, embed, data, time_metrics, xi_feat
                 )
 
             optimizer_time = time.time()
             metrics = self._model_opt(
-                sum(losses.values()) + kl_loss + xi_kl_loss + club_loss,
+                sum(losses.values()) + kl_loss + xi_kl_loss + club_loss + act_mi_loss,
                 self.parameters(),
             )
+            # Fit the action-MI estimators after the world-model step, for the same
+            # reason as the CLUB below: the bounds above hold their weights in the
+            # graph, and stepping them first is an in-place modification that breaks
+            # that backward pass.
+            mine_loss, act_club_nll = None, None
+            if mine_pair is not None:
+                mine_loss = self._act_mi_learn(
+                    self._act_mine, self._act_mine_opt, *mine_pair
+                )
+            if act_club_pair is not None:
+                act_club_nll = self._act_mi_learn(
+                    self._act_club, self._act_club_opt, *act_club_pair
+                )
             if self._club is not None:
                 # Fit q(xi|z) on detached features, by its own optimizer, *after*
                 # the world-model step: the bound above holds the CLUB weights in
@@ -472,6 +627,25 @@ class WorldModel(nn.Module):
                 # residual of two large terms? See CLUB.mi_stats.
                 for k, v in self._club.mi_stats(club_z, club_xi).items():
                     metrics[f"club_{k}"] = to_np(v)
+        # Action-MI. mi is the bound in nats; the companion loss says whether the
+        # estimator has fit well enough for that bound to mean anything. Both are
+        # logged raw -- for the CLUB term, a clamped-to-zero contribution with a
+        # negative act_club_mi is the signal that q is behind.
+        if mine_mi is not None:
+            metrics["action_info/endo_mi"] = to_np(mine_mi)
+            metrics["action_info/endo_fit"] = to_np(mine_loss)
+        if act_club_mi is not None:
+            metrics["action_info/exo_mi"] = to_np(act_club_mi)
+            metrics["action_info/exo_fit"] = to_np(act_club_nll)
+        if mine_mi is not None and act_club_mi is not None:
+            # The gap the two terms jointly widen: action information in the
+            # endogenous stream minus that in the exogenous one. Read it only
+            # alongside the two fit metrics -- it differences a lower bound
+            # against an upper bound estimated by a different net, so it is a
+            # direction of travel, not a calibrated quantity in nats.
+            metrics["action_info/diff"] = to_np(mine_mi - act_club_mi)
+        if torch.is_tensor(act_mi_loss):
+            metrics["action_info/loss"] = to_np(act_mi_loss)
         for name, mse in mses.items():
             metrics[f"{name}_mse"] = to_np(mse)
         metrics.update(time_metrics)

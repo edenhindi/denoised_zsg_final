@@ -121,6 +121,29 @@ defaults:
   # fit p(xi|z), so q should stay ahead of the streams it is measuring.
   club_inner_steps: 1
 
+  # Action-MI terms. Both condition on a learned task embedding and are taken
+  # against the action: MINE maximizes I((e, s, s'); a) so the endogenous
+  # transition stays action-informative, CLUB minimizes I((e, xi, xi'); a)
+  # so the exogenous stream does not encode the action. s/s' are get_feat(post) at
+  # consecutive steps, so the last timestep is dropped. Both use full feat
+  # regardless of club_input. 0 disables each independently; the CLUB one needs
+  # use_exo. Estimators are fit by their own optimizers on detached inputs.
+  act_mine_scale: 0.0
+  act_club_scale: 0.0
+  act_mi_hidden: 256
+  act_mi_layers: 2
+  act_mi_lr: 3e-4
+  act_mi_inner_steps: 1
+  # MINE's gradient bias correction; see mi_estimators.MINE.
+  act_mine_ema_decay: 0.99
+  act_mine_clip: 10.0
+  # Both terms condition on a fixed one-hot of the task id, of width
+  # task_train_size -- not a learned embedding, which would take gradients from
+  # these same objectives and could satisfy them by reshaping the task code rather
+  # than the streams. Columns are indexed by task_id, so this needs
+  # task_split_contiguous and labelled task_ids; unlabelled steps and ids outside
+  # the train split are dropped from both estimators.
+
   # Detached linear probes from deter/stoch to task id and optimal arm. Diagnostic
   # only: they never affect the world model. Needs labelled task_ids.
   probe_state: False
