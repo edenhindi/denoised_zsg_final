@@ -235,16 +235,35 @@ class WorldModel(nn.Module):
                     "club_input='logit' needs dyn_discrete and xi_discrete; "
                     "continuous RSSMs carry 'mean'/'std', not 'logit'."
                 )
-            self._club = networks.CLUB(
-                club_z_size,
-                club_xi_size,
-                config.club_hidden,
-                config.club_layers,
-                config.act,
-                config.norm,
-                config.club_normalize_xi,
-                config.club_norm_momentum,
-            ).to(config.device)
+            if config.club_q == "categorical":
+                if not config.xi_discrete:
+                    raise ValueError(
+                        "club_q='categorical' needs xi_discrete; a continuous xi "
+                        "has no categorical to classify."
+                    )
+                # q reads the endogenous stream only -- see _club_inputs for why
+                # xi_deter is not an input -- and predicts the exogenous
+                # categorical, bounding I(z; xi_stoch).
+                self._club = networks.CategoricalCLUB(
+                    club_z_size,
+                    config.xi_stoch,
+                    config.xi_discrete,
+                    config.club_hidden,
+                    config.club_layers,
+                    config.act,
+                    config.norm,
+                ).to(config.device)
+            else:
+                self._club = networks.CLUB(
+                    club_z_size,
+                    club_xi_size,
+                    config.club_hidden,
+                    config.club_layers,
+                    config.act,
+                    config.norm,
+                    config.club_normalize_xi,
+                    config.club_norm_momentum,
+                ).to(config.device)
             self._club_opt = torch.optim.Adam(
                 self._club.parameters(), lr=config.club_lr
             )
@@ -325,6 +344,23 @@ class WorldModel(nn.Module):
         depend on how get_feat happens to order deter and stoch.
         """
         mode = self._config.club_input
+        if self._config.club_q == "categorical":
+            # q reads the endogenous stream alone and predicts the exogenous
+            # categorical, so the bound is the unconditional I(z; xi_stoch).
+            # xi_deter is deliberately *not* an input: conditioning on it let q
+            # predict xi_stoch from the exogenous side, which explained the shared
+            # information away and drove the bound to ~0 (pos -6.0 vs neg -6.2)
+            # while club_nll sat well below chance. The endogenous stream is the
+            # one that has to forget xi, so it is the only thing q may look at.
+            z = {
+                "feat": feat,
+                "deter": post["deter"],
+            }.get(mode)
+            if z is None:
+                z = post["logit" if mode == "logit" else "stoch"]
+                z = z.reshape(*z.shape[:2], -1)
+            x = xi_post["stoch"]
+            return z, x.reshape(*x.shape[:2], -1)
         if mode == "feat":
             return feat, xi_feat
         if mode == "deter":
@@ -465,9 +501,11 @@ class WorldModel(nn.Module):
                 metrics["club_loss"] = to_np(club_loss)
                 metrics["club_nll"] = to_np(club_nll)
                 # Whether q's Gaussian is straining against its targets. See
-                # CLUB.logvar_stats.
-                for k, v in self._club.logvar_stats(club_z).items():
-                    metrics[f"club_{k}"] = to_np(v)
+                # CLUB.logvar_stats. The categorical q has no variance parameter,
+                # so there is nothing to saturate and no analogue to report.
+                if hasattr(self._club, "logvar_stats"):
+                    for k, v in self._club.logvar_stats(club_z).items():
+                        metrics[f"club_{k}"] = to_np(v)
                 # Is the bound's gradient noise-dominated, and is it a small
                 # residual of two large terms? See CLUB.mi_stats.
                 for k, v in self._club.mi_stats(club_z, club_xi).items():

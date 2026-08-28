@@ -626,6 +626,103 @@ class XiRSSM(nn.Module):
         return loss, value, dyn_loss, rep_loss
 
 
+class CategoricalCLUB(nn.Module):
+    """CLUB with a categorical q(xi_stoch | z, context), for discrete xi.
+
+    Same bound as `CLUB` -- only the likelihood family changes. CLUB needs *some*
+    conditional density it can evaluate at any (z, xi) pair; nothing about it
+    requires a Gaussian.
+
+    The Gaussian version is misspecified when xi is a flattened one-hot draw, and
+    it fails in two linked ways that the diagnostics show directly:
+
+    - It drives the variance to the floor (`logvar_frac_floor` ~0.96), because a
+      near-deterministic target makes q want sigma -> 0. The 1/var factor then
+      inflates both terms of the bound to |pos|, |neg| ~ 48.
+    - Worse, it cannot discriminate. Under a Gaussian, log q is -||mu - xi||^2 /
+      2 sigma^2, and the L2 distance between any two *distinct* one-hot patterns is
+      roughly constant -- so a wrong xi scores about as well as the right one,
+      pos ~ neg, and the bound carries no signal.
+
+    A categorical head fixes both: no variance parameter to saturate, and a wrong
+    one-hot gets a genuinely low log-probability.
+
+    q reads the endogenous stream alone, so the bound is the unconditional
+    I(z; xi_stoch). Feeding xi_deter in as a conditioning context was tried and is
+    a trap: it lets q predict xi_stoch from the exogenous side, which explains the
+    shared information away and drives the bound to ~0 (pos -6.0 vs neg -6.2) even
+    though q is predicting well below chance. The endogenous stream is the one that
+    has to forget xi, so it is the only thing q may look at.
+
+    This leaves xi_deter unpenalized as a *target*: if the distractor rides in the
+    exogenous recurrent state, this bound will not see it. That is deliberate --
+    xi is supposed to encode the distractor -- but it means the deter probe stays
+    the check on where the shortcut actually lives.
+    """
+
+    def __init__(self, z_dim, groups, classes, hidden=256, layers=2,
+                 act="SiLU", norm="LayerNorm"):
+        super(CategoricalCLUB, self).__init__()
+        act = getattr(torch.nn, act)
+        norm = getattr(torch.nn, norm)
+        self._groups = groups
+        self._classes = classes
+
+        mods, inp = [], z_dim
+        for _ in range(layers):
+            mods += [nn.Linear(inp, hidden, bias=False), norm(hidden, eps=1e-03), act()]
+            inp = hidden
+        mods += [nn.Linear(inp, groups * classes)]
+        self._logits = nn.Sequential(*mods)
+        self._logits.apply(tools.weight_init)
+
+    @staticmethod
+    def _flat(x):
+        return x.reshape(-1, x.shape[-1])
+
+    def _log_prob(self, z, xi):
+        """log q(xi | z) for flat z (n, d) and flat one-hot xi (m, groups*classes).
+
+        Returns (n, m): every z scored against every xi, which is what the negative
+        term needs. The positives are the diagonal.
+        """
+        logits = self._logits(z).reshape(-1, self._groups, self._classes)
+        logp = torch.log_softmax(logits, dim=-1)
+        onehot = xi.reshape(-1, self._groups, self._classes)
+        # (n, 1, g, c) * (1, m, g, c) summed over classes then groups: picks each
+        # target's log-probability and adds the (independent) groups.
+        return torch.einsum("ngc,mgc->nm", logp, onehot)
+
+    def learning_loss(self, z, xi):
+        """Cross-entropy of q(xi_stoch | z). Detached: fits q only."""
+        z, xi = self._flat(z).detach(), self._flat(xi).detach()
+        # Only the diagonal (each z with its own xi) trains q.
+        return -self._log_prob(z, xi).diagonal().mean()
+
+    def mi_est(self, z, xi):
+        """The CLUB upper bound. Gradients flow to z and xi."""
+        z, xi = self._flat(z), self._flat(xi)
+        logp = self._log_prob(z, xi)
+        return (logp.diagonal() - logp.mean(1)).mean()
+
+    @torch.no_grad()
+    def mi_stats(self, z, xi):
+        """Decomposition of the bound. See CLUB.mi_stats -- same fields, minus the
+        logvar diagnostics, which have no analogue here (that is the point)."""
+        z, xi = self._flat(z), self._flat(xi)
+        logp = self._log_prob(z, xi)
+        pos, neg = logp.diagonal(), logp.mean(1)
+        diff = pos - neg
+        std = diff.std()
+        return {
+            "pos_mean": pos.mean(),
+            "neg_mean": neg.mean(),
+            "diff_std": std,
+            "diff_snr": diff.mean().abs() / std.clamp(min=1e-8),
+            "pos_abs_mean": pos.abs().mean(),
+        }
+
+
 class CLUB(nn.Module):
     """Contrastive Log-ratio Upper Bound on I(z; xi)  (Cheng et al., 2020).
 

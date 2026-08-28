@@ -115,6 +115,13 @@ defaults:
   # factor inflates both terms of the bound while their difference stays small --
   # club_diff_snr ~0.015 with club_logvar_frac_floor 0.96 is that failure. False
   # restores the pre-normalization behaviour of runs up to #11.
+  # Likelihood family for q. 'gaussian' is the original: misspecified when xi is a
+  # flattened one-hot draw, which pins the logvar at its floor (frac_floor ~0.96)
+  # and inflates both terms of the bound while their difference stays ~0.
+  # 'categorical' models the exogenous categorical with a categorical -- no variance
+  # parameter to saturate -- and conditions on xi_deter by concatenating it onto the
+  # input, so the bound is I(z; xi_stoch | xi_deter). Needs xi_discrete.
+  club_q: 'gaussian'
   club_normalize_xi: True
   club_norm_momentum: 0.99
   # Approximator steps per world-model step. The bound is only valid once q has
