@@ -193,9 +193,95 @@ Results:
 * Val Reward: 11.15
 * Test Reward: 12.29
 
+### 12. categorical CLUB
+club_scale swept, fp32, club_input 'feat', `club_q: 'categorical'`
+
+The Gaussian q was misspecified. xi_stoch is a flattened one-hot draw, and a diagonal
+Gaussian on that fails two ways at once: it drives the variance to the floor
+(`club_logvar_frac_floor` 0.96) so the 1/var factor inflates both terms of the bound to
+|pos|, |neg| ~ 48, and - worse - it cannot discriminate, because the L2 distance between
+any two *distinct* one-hot patterns is roughly constant. So a wrong xi scored about as
+well as the right one: pos -47.83 vs neg -47.731, a difference of -0.099 with
+`club_diff_std` 14. The bound was noise, not measurement (`club_diff_snr` 0.015).
+
+Added `CategoricalCLUB` (networks.py): same bound, categorical q instead of Gaussian.
+No variance parameter, so nothing to saturate, and a wrong one-hot gets a genuinely low
+log-probability. Verified on held-out synthetic data - reads ~0.015 when the streams are
+independent and ~30 when z encodes xi. In the real run: `club_diff_std` 14 -> 1.96, the
+metrics are stable, and `club_nll` 5.88 is interpretable against a chance of
+4*ln(16) = 11.09.
+
+Conditioning on xi_deter (feeding it to q as a meta-RL style context variable) was tried
+and is a trap: it lets q predict xi_stoch from the exogenous side, so the bound collapsed
+to 0.2 (pos -6.0, neg -6.2) while q was predicting well below chance. The conditioning
+explains away the signal. Removed - q now reads the endogenous stream alone.
+
+Scale sweep, reading where the bound settles rather than the knob:
+- 0.01 -> `club_mi` grows to ~1.3 (~12% of the 11.09 ceiling). Too little pressure.
+- 0.03 -> converges nicely, but returns oscillate between 4 and 10.
+- 0.1  -> `club_mi` held to 0.1-0.15, learning suffers.
+
+Results (0.03):
+* Returns oscillating 4-10, no convergence
+
 ---
 
 ## Settled findings (not runs)
+
+**I(z; xi) is not identifiable on this task.** This is why the CLUB direction is being
+dropped, and it is not an estimator problem - #12 fixed the estimator and the behaviour
+stayed. On train tasks `optimal_arm = task_id % num_arms` and the distractor is a fixed
+function of task_id, so distractor and arm are *perfectly correlated on the training
+distribution*. The bound therefore cannot separate "z knows the arm" (needed to act)
+from "z knows the distractor" (the shortcut) - on train data they are the same quantity.
+Driving I(z; xi) down strips capability along with shortcut, which is exactly the
+0.01/0.03/0.1 tradeoff above: too little suppression, or oscillating returns, with no
+scale in between that gets one without the other.
+
+Conditioning on task_id does not rescue it. With `static_distractor: True`, xi is a
+deterministic function of task_id, so H(xi | task) = 0 and I(z; xi | task) = 0 for *any*
+z - a memorizing one, a random one, a constant one. Same-task negatives all have
+xi_j = xi_i, so pos = neg identically. The quantity is vacuous, not just hard to
+estimate. A coarser conditioning variable (groups of tasks sharing the required
+behaviour) would leave xi varying within a group and is the direction worth pursuing -
+see the clustering/EM note below.
+
+**Read chance level before calling a bound "low".** `club_nll` 5.88 sounds bad and is
+in fact well below the 11.09 chance level for a 4x16 categorical - q was predicting
+~47% of the information. Under the Gaussian, `club_nll ~ -60` was a log *density* and
+could not be compared to anything. Same for the bound itself: 0.15 nats against a
+ceiling of 11.09 is ~1.4%, but 0.15 *because the penalty is holding it there* (0.1) is a
+different fact from 0.15 *because the streams are independent* - the 0.01 run, where it
+grew to 1.3, is what distinguishes them.
+
+**The mi_stats diagnostics are what made #12 decidable.** `club_pos_mean`,
+`club_neg_mean`, `club_diff_std`, `club_diff_snr` (models.py, from `CLUB.mi_stats`).
+Low SNR alone distinguishes nothing - a genuinely independent pair also reads ~0.01,
+correctly. The signature of a *broken* estimator is large terms with a large spread and
+a near-zero difference: |pos| ~ 48 with diff_std 14. A healthy independent pair has
+small terms *and* small spread.
+
+**Next direction: manipulate the latents by controllability, not by information.** The
+endogenous/exogenous split has an asymmetry the MI bound does not use - the arm is
+action-relevant, the distractor is not, and that holds regardless of how correlated they
+are on train tasks. Minimize I[(xi, xi'); a] (an upper bound, so CLUB - and the actions
+are discrete, so the categorical q is correctly specified) and maximize action
+predictability from (s, s') (a lower bound, but maximizing MI = minimizing a classifier's
+cross-entropy, since H(a) is fixed by the behaviour policy - no adversarial estimator
+needed). I[s; R] is likely redundant on bandits, since reward depends only on the arm;
+the mirror term I[xi; R] is not - a xi that predicts reward has encoded the arm, which is
+the leak. Both xi-side terms are minimizations on xi, the same pressure that collapsed
+the exogenous stream in run #2, so watch xi entropy against the 11.09 max.
+
+**Future: cluster the task space into endogenous groups (EM).** E-step assigns tasks to
+groups by behavioural signature (shared reward/action structure, defined on the
+endogenous side only); M-step penalizes I(z; xi | group). Within a group xi genuinely
+varies while the required behaviour is fixed, so the conditional MI is non-vacuous and
+the penalty removes distractor association without stripping arm knowledge. Two hazards:
+the group count is load-bearing (one task per group is vacuous, one group for everything
+is the current unconditional bound), and clustering on the agent's own behaviour inherits
+whatever shortcut it has already learned. Bandits is a good testbed because the answer is
+known - the recovered groups should match `task_id % num_arms`.
 
 **fp16 was corrupting the runs (#1-#6).** `model_grad_norm` was 300-10000 and hit
 inf/nan, while every world-model loss term was small and *falling* (decoder 0.001, kl
