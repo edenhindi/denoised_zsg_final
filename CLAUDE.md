@@ -142,8 +142,8 @@ with no prefix — don't go looking for `eval_generalization_gap`.
 
 **Check train return before interpreting any gap.** A gap near zero means nothing if the
 agent never learned explore-exploit — that looks identical to perfect generalization. For
-the default 60-task/5-arm/20-step setup the reference points are roughly: random ≈ 12,
-always-wrong-arm ≈ 10, oracle = 20.
+the default 60-task/5-arm/20-step setup the reference points are roughly: random ≈ 4,
+always-wrong-arm ≈ 0, oracle = 20.
 
 **Per-episode return spread is mostly exploration cost, not measurement noise.** With 20
 binary-reward steps, an episode that identifies the arm on step 2 scores ~18 while one

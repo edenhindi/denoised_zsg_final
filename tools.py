@@ -44,6 +44,11 @@ class Logger:
         wandb.init(
             project="dreamer-v3",
             name=config.exp_label,
+            # Repeats of one config share a group, so wandb aggregates them into a
+            # single mean/band instead of N unrelated lines. Nothing here is seeded
+            # (no torch.manual_seed anywhere), so repeats of an identical config are
+            # already independent draws -- the group is the whole comparison.
+            group=getattr(config, "wandb_group", "") or None,
             config=config,
             # mode="disabled",  # for debug don't capture wandb
         )

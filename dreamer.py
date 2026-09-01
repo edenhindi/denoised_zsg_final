@@ -381,6 +381,11 @@ def main(config):
     if not config.meta_learning and config.num_meta_episodes > 1:
         raise ValueError("Cannot use more than one meta episode without meta learning")
 
+    # Previously dead config: without this, repeats of one config were unreproducible.
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
     config.steps //= config.action_repeat

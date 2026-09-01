@@ -219,12 +219,28 @@ explains away the signal. Removed - q now reads the endogenous stream alone.
 Scale sweep, reading where the bound settles rather than the knob:
 - 0.01 -> `club_mi` grows to ~1.3 (~12% of the 11.09 ceiling). Too little pressure.
 - 0.03 -> converges nicely, but returns oscillate between 4 and 10.
-- 0.1  -> `club_mi` held to 0.1-0.15, learning suffers.
+- 0.1  -> `club_mi` held to 0.1-0.15, learning suffers. returns around 1-4
 
 Results (0.03):
 * Returns oscillating 4-10, no convergence
 
 ---
+
+### 13. bandits_smaller_latents_xi_encoder_action_info_wvclub0.1
+Categorical club 0.1 + action info at 1.0
+
+learning slowly but achieves a return of 12.35
+### 14. bandits_smaller_latents_xi_encoder_vclub0.0cat
+without any information effect. 
+
+achieves test return of 14.58
+the train as expected achieves very good results, validation is oscillating around 12
+
+### 15. bandits_smaller_latents_xi_encoder_action_info_wvclub0.03
+Categorical club 0.03 + action info at 1.0
+
+learning slowly but achieves a return of 12.35
+
 
 ## Settled findings (not runs)
 
