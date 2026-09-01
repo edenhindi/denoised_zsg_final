@@ -143,14 +143,16 @@ class Dreamer(nn.Module):
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
+        # Must match the slice the actor was trained on.
+        actor_feat = self._task_behavior.actor_feat(feat)
         if not training:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(actor_feat)
             action = actor.mode()
         elif self._should_expl(self._logger.get_agent_frames()):
-            actor = self._expl_behavior.actor(feat)
+            actor = self._expl_behavior.actor(self._expl_behavior.actor_feat(feat))
             action = actor.sample()
         else:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(actor_feat)
             action = actor.sample()
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}

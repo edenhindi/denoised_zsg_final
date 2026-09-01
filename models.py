@@ -101,7 +101,8 @@ class WorldModel(nn.Module):
                 config.initial,
                 self.xi_encoder.outdim if self.xi_encoder is not None else self.embed_size,
                 config.device,
-                config.task_train_size if config.xi_ctx_scale > 0 else 0,
+                config.task_train_size if config.xi_ctx_cond else 0,
+                config.xi_ctx_dim,
             )
             xi_feat_size = (
                 self.xi_dynamics.feat_size
@@ -373,18 +374,6 @@ class WorldModel(nn.Module):
             metrics["probe/chance_arm"] = 1.0 / self._config.num_arms
         return metrics
 
-    def _context_loss(self, xi_post, data):
-        """Cross-entropy from xi_deter to the task id, over labelled steps only."""
-        n = self._config.task_train_size
-        target = data["task_id"].long()
-        valid = (target >= 0) & (target < n)
-        if not torch.any(valid):
-            return torch.zeros((), device=self._config.device)
-        logits = self.xi_dynamics.context_logits(xi_post)
-        return torch.nn.functional.cross_entropy(
-            logits[valid], target[valid]
-        )
-
     def xi_embed(self, data, embed):
         """Embedding for the exogenous stream: its own reward-free one, or shared."""
         return self.xi_encoder(data) if self.xi_encoder is not None else embed
@@ -531,7 +520,8 @@ class WorldModel(nn.Module):
                 if self._use_exo:
                     xi_rssm_time = time.time()
                     xi_post, xi_prior = self.xi_dynamics.observe(
-                        self.xi_embed(data, embed), data["is_first"]
+                        self.xi_embed(data, embed), data["is_first"],
+                        task_id=data.get("task_id"),
                     )
                     self._add_wm_timing(time_metrics, 'xi_rssm', time.time() - xi_rssm_time)
                     xi_kl_loss, xi_kl_value, xi_dyn_loss, xi_rep_loss = (
@@ -544,9 +534,6 @@ class WorldModel(nn.Module):
                         )
                     )
                     xi_kl_loss = self._config.xi_kl_scale * xi_kl_loss
-                    if self._config.xi_ctx_scale > 0:
-                        xi_ctx_loss = self._context_loss(xi_post, data)
-                        xi_kl_loss = xi_kl_loss + self._config.xi_ctx_scale * xi_ctx_loss
 
                 get_features_time = time.time()
                 feat = self.dynamics.get_feat(post)
@@ -647,8 +634,6 @@ class WorldModel(nn.Module):
             metrics["xi_dyn_loss"] = to_np(xi_dyn_loss)
             metrics["xi_rep_loss"] = to_np(xi_rep_loss)
             metrics["xi_kl"] = to_np(torch.mean(xi_kl_value))
-            if self._config.xi_ctx_scale > 0:
-                metrics["xi_ctx_loss"] = to_np(xi_ctx_loss)
             if self._club is not None:
                 # club_mi is the bound on I(z; xi) in nats; club_nll says whether q
                 # has fit well enough for that bound to mean anything.
@@ -918,11 +903,21 @@ class ImagBehavior(nn.Module):
         self._reward = reward
 
         if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            stoch_size = config.dyn_stoch * config.dyn_discrete
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+            stoch_size = config.dyn_stoch
+        feat_size = stoch_size + config.dyn_deter
+        # get_feat returns cat([stoch, deter], -1); actor_input picks the slice the
+        # actor reads. The value always gets the full feature.
+        self._actor_input = config.actor_input
+        self._stoch_size = stoch_size
+        actor_feat_size = {
+            "feat": feat_size,
+            "stoch": stoch_size,
+            "deter": config.dyn_deter,
+        }[self._actor_input]
         self.actor = networks.ActionHead(
-            feat_size,
+            actor_feat_size,
             config.num_actions,
             config.actor_layers,
             config.units,
@@ -970,6 +965,14 @@ class ImagBehavior(nn.Module):
         )
         if self._config.reward_EMA:
             self.reward_ema = RewardEMA(device=self._config.device)
+
+    def actor_feat(self, feat):
+        """The slice of get_feat's cat([stoch, deter]) that the actor reads."""
+        if self._actor_input == "stoch":
+            return feat[..., :self._stoch_size]
+        if self._actor_input == "deter":
+            return feat[..., self._stoch_size:]
+        return feat
 
     def _train(
             self,
@@ -1055,7 +1058,7 @@ class ImagBehavior(nn.Module):
             state, _, _ = prev
             feat = dynamics.get_feat(state)
             inp = feat.detach() if self._stop_grad_actor else feat
-            action = policy(inp).sample()
+            action = policy(self.actor_feat(inp)).sample()
             succ = dynamics.img_step(state, action, sample=self._config.imag_sample)
             return succ, feat, action
 
@@ -1074,7 +1077,7 @@ class ImagBehavior(nn.Module):
             discount = self._config.discount * torch.ones_like(reward)
         actor_ent = None
         if self._config.future_entropy and self._config.actor_entropy() > 0:
-            actor_ent = self.actor(imag_feat).entropy()
+            actor_ent = self.actor(self.actor_feat(imag_feat)).entropy()
             reward += self._config.actor_entropy() * actor_ent
         state_ent = None
         if self._config.future_entropy and self._config.actor_state_entropy() > 0:
@@ -1108,7 +1111,7 @@ class ImagBehavior(nn.Module):
     ):
         metrics = {}
         inp = imag_feat.detach() if self._stop_grad_actor else imag_feat
-        policy = self.actor(inp)
+        policy = self.actor(self.actor_feat(inp))
         actor_ent = policy.entropy()
         metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
         # Q-val for actor is not transformed using symlog

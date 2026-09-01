@@ -87,8 +87,10 @@ defaults:
   xi_kl_free: 0.0
   xi_dyn_scale: 0.5
   xi_rep_scale: 0.1
-  # Context classifier weight. Needs task_split_contiguous and labelled task_ids.
-  xi_ctx_scale: 1.0
+  # Task-conditional xi prior p(xi_t | xi_{t-1}, task_id), replacing the old context
+  # classifier. Needs task_split_contiguous and labelled task_ids.
+  xi_ctx_cond: True
+  xi_ctx_dim: 16
   # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
   xi_head_input: 'feat'
 
@@ -216,6 +218,9 @@ defaults:
   imag_gradient: 'dynamics'
   imag_gradient_mix: '0.0'
   imag_sample: True
+  # Which slice of get_feat the actor reads: 'feat' (stoch+deter), 'stoch', 'deter'.
+  # The value always reads the full feature.
+  actor_input: 'feat'
   actor_dist: 'normal'
   actor_entropy: '3e-4'
   actor_state_entropy: 0.0

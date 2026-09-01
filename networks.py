@@ -362,8 +362,10 @@ class XiRSSM(nn.Module):
         embed=None,
         device=None,
         num_contexts=0,
+        ctx_dim=16,
     ):
         super(XiRSSM, self).__init__()
+        self._ctx_dim = int(ctx_dim) if int(num_contexts) > 0 else 0
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
@@ -405,7 +407,7 @@ class XiRSSM(nn.Module):
             raise NotImplementedError(cell)
 
         img_out_layers = []
-        inp_dim = self._deter
+        inp_dim = self._deter + self._ctx_dim
         for i in range(self._layers_output):
             img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
             img_out_layers.append(norm(self._hidden, eps=1e-03))
@@ -437,21 +439,17 @@ class XiRSSM(nn.Module):
             self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
             self._obs_stat_layer.apply(tools.weight_init)
 
-        # Predicts which task the sequence came from. Without it xi's KL is driven to
-        # zero and xi collapses to a constant.
+        # Task-conditional prior p(xi_t | xi_{t-1}, task_id); last row is unlabelled.
         self._num_contexts = int(num_contexts)
         if self._num_contexts > 0:
-            self._ctx_cls = nn.Linear(self._deter, self._num_contexts)
-            self._ctx_cls.apply(tools.weight_init)
+            self._ctx_emb = nn.Embedding(self._num_contexts + 1, ctx_dim)
+            self._ctx_emb.apply(tools.weight_init)
 
         if self._initial == "learned":
             self.W = torch.nn.Parameter(
                 torch.zeros((1, self._deter), device=torch.device(self._device)),
                 requires_grad=True,
             )
-
-    def context_logits(self, state):
-        return self._ctx_cls(state["deter"])
 
     @property
     def feat_size(self):
@@ -487,31 +485,34 @@ class XiRSSM(nn.Module):
         else:
             raise NotImplementedError(self._initial)
 
-    def observe(self, embed, is_first, state=None):
+    def observe(self, embed, is_first, state=None, task_id=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         if state is None:
             state = self.initial(embed.shape[0])
         # (batch, time, ch) -> (time, batch, ch)
-        embed, is_first = swap(embed), swap(is_first)
+        if task_id is None:
+            task_id = torch.full(embed.shape[:2], -1, dtype=torch.long,
+                                 device=embed.device)
+        embed, is_first, task_id = swap(embed), swap(is_first), swap(task_id[..., None])
         post, prior = tools.static_scan(
-            lambda prev_state, embed, is_first: self.obs_step(
-                prev_state[0], embed, is_first
+            lambda prev_state, embed, is_first, task_id: self.obs_step(
+                prev_state[0], embed, is_first, task_id=task_id.squeeze(-1)
             ),
-            (embed, is_first),
+            (embed, is_first, task_id),
             (state, state),
         )
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
-    def imagine(self, horizon, state):
+    def imagine(self, horizon, state, task_id=None):
         """Action-free prior rollout. Used for logging only, never for behavior."""
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         assert isinstance(state, dict), state
         priors = []
         prior = state
         for _ in range(horizon):
-            prior = self.img_step(prior)
+            prior = self.img_step(prior, task_id=task_id)
             priors.append(prior)
         prior = {k: torch.stack([p[k] for p in priors], 0) for k in priors[0].keys()}
         return {k: swap(v) for k, v in prior.items()}
@@ -536,7 +537,7 @@ class XiRSSM(nn.Module):
             )
         return dist
 
-    def obs_step(self, prev_state, embed, is_first, sample=True):
+    def obs_step(self, prev_state, embed, is_first, sample=True, task_id=None):
         if torch.sum(is_first) > 0:
             is_first = is_first[:, None]
             init_state = self.initial(len(is_first))
@@ -546,7 +547,7 @@ class XiRSSM(nn.Module):
                     is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
                 )
                 prev_state[key] = val * (1.0 - is_first_r) + init_state[key] * is_first_r
-        prior = self.img_step(prev_state, sample)
+        prior = self.img_step(prev_state, sample, task_id=task_id)
         x = torch.cat([prior["deter"], embed], -1)
         x = self._obs_out_layers(x)
         stats = self._suff_stats_layer("obs", x)
@@ -557,7 +558,20 @@ class XiRSSM(nn.Module):
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
 
-    def img_step(self, prev_state, sample=True):
+    def _ctx_feat(self, task_id, ref):
+        """Embedding for task_id, mapping the -1 "unlabelled" id to the last row."""
+        if self._ctx_dim == 0:
+            return None
+        if task_id is None:
+            idx = torch.full(ref.shape[:-1], self._num_contexts,
+                             dtype=torch.long, device=ref.device)
+        else:
+            idx = task_id.long()
+            idx = torch.where((idx >= 0) & (idx < self._num_contexts),
+                              idx, torch.full_like(idx, self._num_contexts))
+        return self._ctx_emb(idx)
+
+    def img_step(self, prev_state, sample=True, task_id=None):
         """xi_t -> xi_{t+1}, with no dependence on the action."""
         prev_stoch = prev_state["stoch"]
         if self._discrete:
@@ -567,7 +581,8 @@ class XiRSSM(nn.Module):
         deter = prev_state["deter"]
         x, deter = self._cell(x, [deter])
         deter = deter[0]  # Keras wraps the state in a list.
-        x = self._img_out_layers(x)
+        ctx = self._ctx_feat(task_id, deter)
+        x = self._img_out_layers(x if ctx is None else torch.cat([x, ctx], -1))
         stats = self._suff_stats_layer("ims", x)
         if sample:
             stoch = self.get_dist(stats).sample()
@@ -576,8 +591,9 @@ class XiRSSM(nn.Module):
         prior = {"stoch": stoch, "deter": deter, **stats}
         return prior
 
-    def get_stoch(self, deter):
-        x = self._img_out_layers(deter)
+    def get_stoch(self, deter, task_id=None):
+        ctx = self._ctx_feat(task_id, deter)
+        x = self._img_out_layers(deter if ctx is None else torch.cat([deter, ctx], -1))
         stats = self._suff_stats_layer("ims", x)
         dist = self.get_dist(stats)
         return dist.mode()
