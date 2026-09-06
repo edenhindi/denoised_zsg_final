@@ -71,7 +71,12 @@ class Dreamer(nn.Module):
         self._wm = models.WorldModel(obs_space, act_space, self._logger.get_agent_frames(), config)
         if config.compile and os.name != "nt":  # compilation is not supported on windows
             self._wm = torch.compile(self._wm)
-        reward_prediction = lambda f, s, a: self._wm.heads["reward"](f).mode()
+        if config.reward_head_action:
+            reward_prediction = lambda f, s, a: self._wm.heads["reward"](
+                torch.cat([self._wm.reward_feat(f), a], -1)).mode()
+        else:
+            reward_prediction = lambda f, s, a: self._wm.heads["reward"](
+                self._wm.reward_feat(f)).mode()
         self._task_behavior = models.ImagBehavior(
             config, logger, self._wm, config.behavior_stop_grad, reward_prediction)
         if config.compile and os.name != "nt":  # compilation is not supported on windows
@@ -216,9 +221,13 @@ class Dreamer(nn.Module):
             start = {k: v[batch_indices, idx] for k, v in start.items()}
             metrics["subsample_batch_for_policy_time"] = time.time() - subsample_batch_for_policy_time
 
-        task_policy_train_time = time.time()
-        metrics.update(self._task_behavior._train(start)[-1])
-        metrics["task_policy_train_time"] = time.time() - task_policy_train_time
+        # Freeze the policy while collection is random: otherwise it spends the whole
+        # warmup fitting the imagined objective with no on-policy data to contradict it,
+        # and takes over already converged.
+        if self._logger.get_agent_frames() >= self._config.random_until:
+            task_policy_train_time = time.time()
+            metrics.update(self._task_behavior._train(start)[-1])
+            metrics["task_policy_train_time"] = time.time() - task_policy_train_time
 
         if self._config.expl_behavior != "greedy" and self._config.expl_behavior != "epsilon_greedy":
             if batch_indices is not None:
@@ -460,26 +469,27 @@ def main(config):
     acts = helper_env.action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
+    if hasattr(acts, "discrete"):
+        random_actor = tools.OneHotDist(
+            torch.zeros(config.num_actions).repeat(config.envs, 1)
+        )
+    else:
+        random_actor = torchd.independent.Independent(
+            torchd.uniform.Uniform(
+                torch.Tensor(acts.low).repeat(config.envs, 1),
+                torch.Tensor(acts.high).repeat(config.envs, 1),
+            ),
+            1,
+        )
+
+    def random_agent(o, d, s):
+        action = random_actor.sample()
+        logprob = random_actor.log_prob(action)
+        return {"action": action, "logprob": logprob}, None
+
     if not config.offline_traindir:
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} episodes).")
-        if hasattr(acts, "discrete"):
-            random_actor = tools.OneHotDist(
-                torch.zeros(config.num_actions).repeat(config.envs, 1)
-            )
-        else:
-            random_actor = torchd.independent.Independent(
-                torchd.uniform.Uniform(
-                    torch.Tensor(acts.low).repeat(config.envs, 1),
-                    torch.Tensor(acts.high).repeat(config.envs, 1),
-                ),
-                1,
-            )
-
-        def random_agent(o, d, s):
-            action = random_actor.sample()
-            logprob = random_actor.log_prob(action)
-            return {"action": action, "logprob": logprob}, None
 
         prefill_tasks = [sample_train_task() for _ in range(config.prefill)]
         _, steps_taken, _ = tools.simulate(
@@ -575,8 +585,12 @@ def main(config):
         dreamer_training_time = time.time()
         print("Start training.")
         train_tasks = [sample_train_task() for _ in range(config.envs)]
+        # Collect with a uniform-random policy until random_until frames. The world
+        # model still trains below, so its early gradients come from data where the
+        # arm pulled is independent of the distractor.
+        in_random = logger.get_agent_frames() < config.random_until
         _, steps_taken, _ = tools.simulate(
-            agent,
+            random_agent if in_random else agent,
             train_envs,
             train_tasks,
             train_eps,
@@ -588,6 +602,7 @@ def main(config):
         )
         collected_episodes += config.envs
         logger.step += steps_taken * config.action_repeat
+        logger.scalar("random_collection", float(in_random))
         agent.update_models(int(config.train_ratio * steps_taken / config.num_meta_episodes))
 
         torch.save(agent.state_dict(), logdir / "latest_model.pt")

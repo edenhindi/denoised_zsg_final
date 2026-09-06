@@ -71,9 +71,11 @@ class WorldModel(nn.Module):
         )
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            stoch_size = config.dyn_stoch * config.dyn_discrete
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+            stoch_size = config.dyn_stoch
+        feat_size = stoch_size + config.dyn_deter
+        self._stoch_size = stoch_size
 
         # Exogenous stream: an action-free RSSM whose decoded output is added to the
         # endogenous decoder's. It feeds the observation reconstruction only -- the
@@ -121,8 +123,17 @@ class WorldModel(nn.Module):
                 xi_feat_size=xi_feat_size,
             )
         reward_mlp_shape = (255,) if config.reward_head == "symlog_disc" else []
+        # With reward_head_action the head is r = f(feat, a) rather than f(feat), so it
+        # cannot fit reward without representing which action was taken.
+        # reward_head_input picks the slice it reads: 'stoch' hides the recurrent state,
+        # where a per-episode-constant distractor would otherwise sit.
+        self._reward_head_action = config.reward_head_action
+        self._reward_head_input = config.reward_head_input
+        reward_feat = {"feat": feat_size, "stoch": stoch_size,
+                       "deter": config.dyn_deter}[self._reward_head_input]
+        reward_in = reward_feat + (config.num_actions if self._reward_head_action else 0)
         self.heads["reward"] = networks.MLP(
-            feat_size,  # pytorch version
+            reward_in,  # pytorch version
             reward_mlp_shape,
             config.reward_layers,
             config.units,
@@ -734,6 +745,14 @@ class WorldModel(nn.Module):
             if xi_feat is not None:
                 xi_feat = xi_feat[batch_indices, sequence_indices]
 
+        # Same indices as feat, for the same reason.
+        reward_action = None
+        if self._reward_head_action:
+            reward_action = data["action"]
+            if sequence_indices is not None:
+                idx = np.arange(reward_action.shape[0])[:, np.newaxis]
+                reward_action = reward_action[idx, sequence_indices]
+
         self._add_wm_timing(time_metrics, 'sample_features', time.time() - sample_features_time)
 
         repeat_data_time = time.time()
@@ -766,6 +785,11 @@ class WorldModel(nn.Module):
                     pred = head(feat_and_embed_input)
             elif curr_xi is not None:
                 pred = head(curr_feat, curr_xi)
+            elif name == "reward":
+                rf = self.reward_feat(curr_feat)
+                if reward_action is not None:
+                    rf = torch.cat([rf, reward_action], -1)
+                pred = head(rf)
             else:
                 pred = head(curr_feat)
 
@@ -810,6 +834,14 @@ class WorldModel(nn.Module):
 
         self._add_wm_timing(time_metrics, 'compute_loss', time.time() - compute_loss_time)
         return losses, mses
+
+    def reward_feat(self, feat):
+        """The slice of get_feat's cat([stoch, deter]) the reward head reads."""
+        if self._reward_head_input == "stoch":
+            return feat[..., :self._stoch_size]
+        if self._reward_head_input == "deter":
+            return feat[..., self._stoch_size:]
+        return feat
 
     def preprocess(self, obs):
         obs = obs.copy()

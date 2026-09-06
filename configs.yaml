@@ -31,6 +31,10 @@ defaults:
   time_limit: 1000
   grayscale: False
   prefill: 25
+  # Collect with a uniform-random policy for this many agent frames while the models
+  # still train, so the world model's early gradients come from data where the action
+  # is independent of the observation. 0 disables.
+  random_until: 0
   eval_noise: 0.0
   reward_EMA: True
   num_meta_episodes: 1
@@ -175,6 +179,12 @@ defaults:
     { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 2, mlp_units: 512, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse }
   value_head: 'symlog_disc'
   reward_head: 'symlog_disc'
+  # Feed the action to the reward head, so it is r = f(feat, a) and cannot fit reward
+  # without representing the action. online-zsg's head is f(x_flat, action).
+  reward_head_action: False
+  # Which slice of get_feat the reward head reads: 'feat', 'stoch', 'deter'.
+  # 'stoch' + reward_head_action matches online-zsg's f(x_flat, action).
+  reward_head_input: 'feat'
   dyn_scale: '0.5'
   rep_scale: '0.1'
   kl_free: '1.0'
@@ -389,8 +399,9 @@ bandits:
   # default sentinel of -1 drives the horizon negative as training progresses.
   reach_wm_horizon_limit: 2e4
   logdir: ./bandits
-  encoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 4 }
-  decoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 4 }
+  encoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64 }
+  decoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64 }
+  units: 64
   actor_dist: 'onehot'
   imag_gradient: 'reinforce'
   imag_horizon: 10
@@ -419,6 +430,7 @@ bandits:
   # actor_entropy: '1e-3'
   discount: 0.99
   
+  log_every: 500
 # Same as `bandits` but the distractor drifts within the episode, so it is harder
 # to bind to a single optimal arm. Run as: --configs bandits bandits_drift
 bandits_drift:
