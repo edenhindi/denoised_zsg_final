@@ -98,67 +98,66 @@ defaults:
   # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
   xi_head_input: 'feat'
 
-  # CLUB: a variational upper bound on I(endogenous feat; xi feat), added to the
-  # world-model loss to drive the two streams apart. Needs use_exo. The approximator
-  # q(xi|z) is fit by its own optimizer on detached features, so it never shapes the
-  # world model except through the bound. 0 disables it.
-  club_scale: 0.0
-  club_hidden: 256
-  club_layers: 2
-  club_lr: 3e-4
-  # Which part of each stream the bound is taken over: 'feat' (deter ++ stoch),
-  # 'deter', 'stoch', or 'logit'. Applied to both streams, and independent of
-  # xi_head_input, which controls what the *decoder* branch reads.
-  # 'logit' is the categorical's parameters rather than a draw from it: same
-  # width as 'stoch', but continuous and free of per-step sampling noise, so the
-  # diagonal-Gaussian q is much better specified. Needs discrete latents.
-  # 'stoch' keeps the pressure off the recurrent state, where the within-episode
-  # explore/exploit history lives -- penalizing MI there can strip the arm-relevant
-  # history the policy needs, since distractor and arm are correlated on train tasks.
-  # Note 'feat'/'stoch' feed a flattened one-hot categorical to a diagonal-Gaussian
-  # q, which is misspecified and inflates the magnitude of club_nll.
-  club_input: 'feat'
-  # Standardize xi (running mean/var, no_grad buffers) before the bound. The logvar
-  # head is tanh-bounded to [-1, 1], so q can only express variances in [e^-1, e^1];
-  # when xi's own scale falls below that, q pins every dim at the floor and the 1/var
-  # factor inflates both terms of the bound while their difference stays small --
-  # club_diff_snr ~0.015 with club_logvar_frac_floor 0.96 is that failure. False
-  # restores the pre-normalization behaviour of runs up to #11.
-  # Likelihood family for q. 'gaussian' is the original: misspecified when xi is a
-  # flattened one-hot draw, which pins the logvar at its floor (frac_floor ~0.96)
-  # and inflates both terms of the bound while their difference stays ~0.
-  # 'categorical' models the exogenous categorical with a categorical -- no variance
-  # parameter to saturate -- and conditions on xi_deter by concatenating it onto the
-  # input, so the bound is I(z; xi_stoch | xi_deter). Needs xi_discrete.
-  club_q: 'gaussian'
-  club_normalize_xi: True
-  club_norm_momentum: 0.99
-  # Approximator steps per world-model step. The bound is only valid once q has
-  # fit p(xi|z), so q should stay ahead of the streams it is measuring.
-  club_inner_steps: 1
+  # Mutual-information terms, named for the pair each is taken over. All three are
+  # off unless use_infolosses is True; a scale of 0 then disables one individually.
+  # Metrics: mi/<term>/{bound,loss,fit} -- read `bound` only alongside `fit`, which
+  # says whether the estimator has converged.
+  #
+  #   endo_exo_mi  I(z; xi)           CLUB upper bound, minimized. Needs use_exo.
+  #   act_endo_mi  I((e, s, s'); a)   MINE lower bound, maximized.
+  #   act_exo_mi   I((e, xi, xi'); a) CLUB upper bound, minimized. Needs use_exo.
+  #   rew_endo_mi  I((e, s, s'); G)   MINE lower bound, maximized.
+  #   rew_exo_mi   I((e, xi, xi'); G) CLUB upper bound, minimized. Needs use_exo.
+  use_infolosses: False
 
-  # Action-MI terms. Both condition on a learned task embedding and are taken
-  # against the action: MINE maximizes I((e, s, s'); a) so the endogenous
-  # transition stays action-informative, CLUB minimizes I((e, xi, xi'); a)
-  # so the exogenous stream does not encode the action. s/s' are get_feat(post) at
-  # consecutive steps, so the last timestep is dropped. Both use full feat
-  # regardless of club_input. 0 disables each independently; the CLUB one needs
-  # use_exo. Estimators are fit by their own optimizers on detached inputs.
-  act_mine_scale: 0.0
-  act_club_scale: 0.0
-  act_mi_hidden: 256
-  act_mi_layers: 2
-  act_mi_lr: 3e-4
-  act_mi_inner_steps: 1
+  # Shared net/optimizer defaults; a term overrides one as <term>_<key>, e.g.
+  # endo_exo_mi_lr. inner_steps is estimator steps per world-model step.
+  mi_hidden: 256
+  mi_layers: 2
+  mi_lr: 3e-4
+  mi_inner_steps: 1
+
+  endo_exo_mi_scale: 0.1
+  # Which part of each stream the bound is taken over: 'feat' (deter ++ stoch),
+  # 'deter', 'stoch', or 'logit'. Applied to both streams, independent of
+  # xi_head_input. 'logit' is continuous and sampling-noise-free, so the Gaussian q
+  # is far better specified; needs discrete latents. 'stoch' keeps the pressure off
+  # the recurrent state, where the explore/exploit history lives. 'feat'/'stoch'
+  # feed a flattened one-hot to a diagonal-Gaussian q, which is misspecified.
+  endo_exo_mi_input: 'feat'
+  # 'gaussian' is misspecified against a one-hot draw: it pins the logvar at its
+  # floor (frac_floor ~0.96) and inflates both terms while their difference stays
+  # ~0. 'categorical' has no variance to saturate and conditions on xi_deter, so
+  # the bound is I(z; xi_stoch | xi_deter). Needs xi_discrete.
+  endo_exo_mi_q: 'categorical' # can be categorical or gaussian
+  # Standardize xi before the bound. The tanh-bounded logvar can only express
+  # variances in [e^-1, e^1]; below that q pins at the floor. False restores the
+  # pre-normalization behaviour of runs up to #11.
+  endo_exo_mi_normalize: False
+  endo_exo_mi_norm_momentum: 0.99
+
+  act_endo_mi_scale: 0.0
   # MINE's gradient bias correction; see mi_estimators.MINE.
-  act_mine_ema_decay: 0.99
-  act_mine_clip: 10.0
-  # Both terms condition on a fixed one-hot of the task id, of width
-  # task_train_size -- not a learned embedding, which would take gradients from
-  # these same objectives and could satisfy them by reshaping the task code rather
-  # than the streams. Columns are indexed by task_id, so this needs
-  # task_split_contiguous and labelled task_ids; unlabelled steps and ids outside
-  # the train split are dropped from both estimators.
+  act_endo_mi_ema_decay: 0.99
+  act_endo_mi_clip: 10.0
+
+  act_exo_mi_scale: 0.0
+
+  rew_endo_mi_scale: 0.1
+  rew_endo_mi_ema_decay: 0.99
+  rew_endo_mi_clip: 10.0
+
+  rew_exo_mi_scale: 0.1
+  # Bucket count for the two-hot return target, matching tools.DiscDist. G is the
+  # discounted return-to-go over the rewards actually in the buffer -- not a critic
+  # estimate, which would be a function of the endogenous stream being measured.
+  rew_mi_bins: 255
+
+  # All four pair terms use full feat regardless of endo_exo_mi_input, and condition
+  # on a fixed one-hot of the task id (width task_train_size) -- not a learned
+  # embedding, which could satisfy them by reshaping the task code rather than the
+  # streams. s' is the next step, so the last timestep is dropped, as are steps
+  # whose task_id is unlabelled or outside the train split.
 
   # Detached linear probes from deter/stoch to task id and optimal arm. Diagnostic
   # only: they never affect the world model. Needs labelled task_ids.

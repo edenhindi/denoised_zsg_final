@@ -522,8 +522,12 @@ class DiscDist:
         _mode = self.probs * self.buckets
         return self.transbwd(torch.sum(_mode, dim=-1, keepdim=True))
 
-    # Inside OneHotCategorical, log_prob is calculated using only max element in targets
-    def log_prob(self, x):
+    def two_hot(self, x):
+        """Soft one-hot of a scalar over the buckets, in transfwd space.
+
+        Mass splits between the two buckets the value falls between, weighted by
+        distance, so nearby values get nearby codes and the ordering survives.
+        """
         x = self.transfwd(x)
         # x(time, batch, 1)
         below = torch.sum((self.buckets <= x[..., None]).to(torch.int32), dim=-1) - 1
@@ -543,9 +547,12 @@ class DiscDist:
                 F.one_hot(below, num_classes=len(self.buckets)) * weight_below[..., None]
                 + F.one_hot(above, num_classes=len(self.buckets)) * weight_above[..., None]
         )
-        log_pred = self.logits - torch.logsumexp(self.logits, -1, keepdim=True)
-        target = target.squeeze(-2)
+        return target.squeeze(-2)
 
+    # Inside OneHotCategorical, log_prob is calculated using only max element in targets
+    def log_prob(self, x):
+        target = self.two_hot(x)
+        log_pred = self.logits - torch.logsumexp(self.logits, -1, keepdim=True)
         return (target * log_pred).sum(-1)
 
     def log_prob_target(self, target):
