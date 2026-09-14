@@ -236,6 +236,7 @@ class InfoLosses(nn.Module):
                                          what the exogenous one already explains
         rew_endo_mi  I((e, s, s'); G)    maximized -- endogenous stays return-informative
         rew_exo_mi   I((e, xi, xi'); G)  minimized -- exogenous does not encode return
+        embed_exo_mi I(embed; xi_stoch)  minimized -- at the encoder bottleneck
 
     G is the discounted return-to-go computed from the rewards actually observed
     in the buffer, two-hot encoded. Not a critic estimate: a bootstrapped value is
@@ -261,7 +262,7 @@ class InfoLosses(nn.Module):
     `fit` and `metrics` without a preceding `compute` are no-ops.
     """
 
-    def __init__(self, config, use_exo):
+    def __init__(self, config, use_exo, embed_size=0):
         super(InfoLosses, self).__init__()
         # Imported here, not at module scope: networks imports this module for
         # MINE/CLUB, so a top-level import would be circular.
@@ -320,6 +321,23 @@ class InfoLosses(nn.Module):
             self._endo_exo = self._register("endo_exo_mi", est, sign=1, clamp=True)
         else:
             self._endo_exo = None
+
+        # --- embed_exo_mi: I(embed; xi_stoch), at the encoder bottleneck rather
+        # than the recurrent state. embed feeds both deter and stoch, so there is
+        # nowhere for the information to reroute; and xi_encoder is reward-free, so
+        # the bound cannot strip reward feedback from the endogenous stream.
+        if use_exo and self._opt_for("embed_exo_mi", "scale") > 0:
+            if not config.xi_discrete:
+                raise ValueError("embed_exo_mi needs xi_discrete")
+            est = networks.CategoricalCLUB(
+                embed_size, config.xi_stoch, config.xi_discrete,
+                self._opt_for("embed_exo_mi", "hidden"),
+                self._opt_for("embed_exo_mi", "layers"),
+                config.act, config.norm,
+            )
+            self._embed_exo = self._register("embed_exo_mi", est, sign=1, clamp=True)
+        else:
+            self._embed_exo = None
 
         # --- Action terms. Both condition on a fixed one-hot of the task id: a
         # learned embedding would take gradients from these same objectives and
@@ -519,7 +537,7 @@ class InfoLosses(nn.Module):
     # The three phases
     # ------------------------------------------------------------------
 
-    def compute(self, post, feat, xi_post, xi_feat, data, timing=None):
+    def compute(self, post, feat, xi_post, xi_feat, data, timing=None, embed=None):
         """The MI term added to the world-model objective.
 
         Call BEFORE the prediction losses, which may subsample `feat`, and before
@@ -537,6 +555,13 @@ class InfoLosses(nn.Module):
                 self._endo_exo_inputs(post, feat, xi_post, xi_feat)
             )
             self._add_timing(timing, "endo_exo_mi", time.time() - t)
+        if self._embed_exo is not None and embed is not None:
+            t = time.time()
+            xi_stoch = xi_post["stoch"]
+            total = total + self._embed_exo.compute(
+                (embed, xi_stoch.reshape(*xi_stoch.shape[:2], -1))
+            )
+            self._add_timing(timing, "embed_exo_mi", time.time() - t)
         if self._act_endo is not None or self._act_exo is not None:
             t = time.time()
             action = data["action"]

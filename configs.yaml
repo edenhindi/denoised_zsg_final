@@ -95,8 +95,24 @@ defaults:
   # classifier. Needs task_split_contiguous and labelled task_ids.
   xi_ctx_cond: True
   xi_ctx_dim: 16
+  # Classifier xi_deter -> task_id, added to the loss. Supervises the *posterior*,
+  # so xi must infer the task from the observation; xi_ctx_cond instead tells the
+  # prior, which lets the posterior match it and carry nothing. Independent knobs:
+  # either, both, or neither. 0 disables. Needs labelled task_ids.
+  xi_ctx_scale: 0.0
   # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
   xi_head_input: 'feat'
+  # Penalize Cov(endo_mean, exo_mean) per dimension. The decoder scores only their
+  # sum, so the split is unidentifiable and drifts into large opposite-signed
+  # predictions that cancel. Assumes the additive decoder; says nothing about
+  # which dims belong to which stream. 0 disables. Needs use_exo.
+  branch_decorr_scale: 0.0
+  # Feed the endogenous encoder o_t - o_hat(xi_{t-1}) instead of o_t, where the
+  # prediction comes from the exogenous prior and is detached. Needs use_exo.
+  endo_obs_diff: False
+  # Split the decoder too: the exogenous branch predicts the full o_t and the
+  # endogenous branch the residual, instead of one distribution over their sum.
+  endo_obs_diff_split: False
 
   # Mutual-information terms, named for the pair each is taken over. All three are
   # off unless use_infolosses is True; a scale of 0 then disables one individually.
@@ -108,6 +124,7 @@ defaults:
   #   act_exo_mi   I((e, xi, xi'); a) CLUB upper bound, minimized. Needs use_exo.
   #   rew_endo_mi  I((e, s, s'); G)   MINE lower bound, maximized.
   #   rew_exo_mi   I((e, xi, xi'); G) CLUB upper bound, minimized. Needs use_exo.
+  #   embed_exo_mi I(embed; xi_stoch) CLUB upper bound, minimized. Needs use_exo.
   use_infolosses: False
 
   # Shared net/optimizer defaults; a term overrides one as <term>_<key>, e.g.
@@ -146,6 +163,11 @@ defaults:
   rew_endo_mi_scale: 0.1
   rew_endo_mi_ema_decay: 0.99
   rew_endo_mi_clip: 10.0
+
+  # At the encoder bottleneck: embed feeds both deter and stoch, so there is
+  # nowhere for the information to reroute, and xi_encoder is reward-free, so the
+  # bound cannot strip reward feedback. Categorical q -- xi_stoch is a one-hot.
+  embed_exo_mi_scale: 0.0
 
   rew_exo_mi_scale: 0.1
   # Bucket count for the two-hot return target, matching tools.DiscDist. G is the

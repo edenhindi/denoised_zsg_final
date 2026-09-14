@@ -103,8 +103,11 @@ class WorldModel(nn.Module):
                 config.initial,
                 self.xi_encoder.outdim if self.xi_encoder is not None else self.embed_size,
                 config.device,
-                config.task_train_size if config.xi_ctx_cond else 0,
+                config.task_train_size
+                if (config.xi_ctx_cond or config.xi_ctx_scale > 0) else 0,
                 config.xi_ctx_dim,
+                config.xi_ctx_cond,
+                config.xi_ctx_scale > 0,
             )
             xi_feat_size = (
                 self.xi_dynamics.feat_size
@@ -222,7 +225,7 @@ class WorldModel(nn.Module):
         # must not be world-model parameters, or the model would learn to make them
         # bad instead of making the streams behave. See mi_estimators.InfoLosses for
         # the two-phase compute/fit contract its call sites in _train follow.
-        self._info = mi_estimators.InfoLosses(config, self._use_exo)
+        self._info = mi_estimators.InfoLosses(config, self._use_exo, self.embed_size)
 
     def _probe_metrics(self, post, data):
         """Linear-probe accuracy from detached state parts to task id and arm.
@@ -269,9 +272,78 @@ class WorldModel(nn.Module):
             metrics["probe/chance_arm"] = 1.0 / self._config.num_arms
         return metrics
 
+    def _branch_decorr_loss(self, feat, xi_feat):
+        """Penalize the cross-correlation between the two decoder branches.
+
+        The decoder scores only `endo + exo`, so the split is unidentifiable: add
+        d to one branch and subtract it from the other and the loss is unchanged.
+        The solutions it drifts into are the cancelling ones -- large opposite-
+        signed predictions summing correctly while neither means anything.
+
+        Standardized rather than a raw covariance, since Cov = corr * sigma_e *
+        sigma_x and an unnormalized penalty is cheapest to satisfy by collapsing
+        one branch's variance -- killing the exogenous stream instead of
+        decorrelating it. The full matrix, not just its diagonal: the cancellation
+        need not be dimension-aligned. Nothing here says *which* dimensions belong
+        to which stream.
+        """
+        pairs = self.heads["decoder"].branch_means(feat, xi_feat)
+        if not pairs:
+            return torch.zeros((), device=self._config.device)
+        eps = 1e-6
+        total = 0.0
+        for endo, exo in pairs.values():
+            a = endo.reshape(-1, endo.shape[-1]).float()
+            b = exo.reshape(-1, exo.shape[-1]).float()
+            a = (a - a.mean(0)) / (a.std(0) + eps)
+            b = (b - b.mean(0)) / (b.std(0) + eps)
+            c = (a.T @ b) / (a.shape[0] - 1)
+            total = total + c.square().sum() / min(a.shape[1], b.shape[1])
+        return total / len(pairs)
+
+    def _context_loss(self, xi_post, data):
+        """Cross-entropy from xi_deter to the task id, over labelled steps only.
+
+        Supervises the posterior directly, so xi must infer the task from the
+        observation. Unlike xi_ctx_cond, which tells the *prior* the task and so
+        leaves the posterior free to match it and carry nothing.
+        """
+        n = self._config.task_train_size
+        target = data["task_id"].long()
+        valid = (target >= 0) & (target < n)
+        if not torch.any(valid):
+            return torch.zeros((), device=self._config.device)
+        logits = self.xi_dynamics.context_logits(xi_post)
+        return torch.nn.functional.cross_entropy(logits[valid], target[valid])
+
     def xi_embed(self, data, embed):
         """Embedding for the exogenous stream: its own reward-free one, or shared."""
         return self.xi_encoder(data) if self.xi_encoder is not None else embed
+
+    @property
+    def _obs_diff_split(self):
+        """Exogenous branch predicts o_t, endogenous predicts the residual."""
+        return (self._use_exo and self._config.endo_obs_diff
+                and self._config.endo_obs_diff_split)
+
+    def _obs_diff(self, data, xi_state):
+        """Replace observation keys with o_t - o_hat(xi_state).
+
+        Called with the prior for the encoder's input (it has not seen o_t, so
+        nothing leaks) and with the posterior for the decoder's target (that is
+        what the decoder adds back). Detached either way: this shapes the
+        endogenous stream, not xi.
+        """
+        dec = self.heads["decoder"]
+        if not getattr(dec, "xi_mlp_shapes", None):
+            return data
+        with torch.no_grad():
+            stats = dec._mlp_xi.forward_stats(self.get_xi_feat(xi_state))
+        out = dict(data)
+        for key, (mean, _) in stats.items():
+            if key in out:
+                out[key] = out[key] - mean.detach().reshape(out[key].shape)
+        return out
 
     def get_xi_feat(self, xi_state):
         """The exogenous feature the decoder branch reads."""
@@ -293,8 +365,29 @@ class WorldModel(nn.Module):
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
+                # Exogenous stream first when the endogenous encoder reads the
+                # residual: no cycle, since xi_encoder reads data, not embed.
+                xi_post, xi_prior, xi_kl_loss = None, None, 0.0
+                if self._use_exo:
+                    xi_rssm_time = time.time()
+                    xi_post, xi_prior = self.xi_dynamics.observe(
+                        self.xi_embed(data, None), data["is_first"],
+                        task_id=data.get("task_id"),
+                    )
+                    self._add_wm_timing(time_metrics, 'xi_rssm', time.time() - xi_rssm_time)
+
                 embedding_time = time.time()
-                embed = self.encoder(data)
+                endo_data, diff_target = data, data
+                if self._use_exo and self._config.endo_obs_diff:
+                    # Encoder reads the residual against the *prior*: the prior has
+                    # not seen o_t, so nothing leaks back through xi. The decoder
+                    # target uses the *posterior*, because that is what the decoder
+                    # adds back -- scoring against the prior residual would leave
+                    # the prior-to-posterior gap for the endogenous branch to
+                    # predict twice.
+                    endo_data = self._obs_diff(data, xi_prior)
+                    diff_target = self._obs_diff(data, xi_post)
+                embed = self.encoder(endo_data)
                 self._add_wm_timing(time_metrics, 'embedding', time.time() - embedding_time)
                 rssm_time = time.time()
                 post, prior = self.dynamics.observe(
@@ -308,15 +401,7 @@ class WorldModel(nn.Module):
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
 
-                # Exogenous stream: no action input, and no reward when xi_no_reward.
-                xi_post, xi_prior, xi_kl_loss = None, None, 0.0
                 if self._use_exo:
-                    xi_rssm_time = time.time()
-                    xi_post, xi_prior = self.xi_dynamics.observe(
-                        self.xi_embed(data, embed), data["is_first"],
-                        task_id=data.get("task_id"),
-                    )
-                    self._add_wm_timing(time_metrics, 'xi_rssm', time.time() - xi_rssm_time)
                     xi_kl_loss, xi_kl_value, xi_dyn_loss, xi_rep_loss = (
                         self.xi_dynamics.kl_loss(
                             xi_post,
@@ -327,26 +412,35 @@ class WorldModel(nn.Module):
                         )
                     )
                     xi_kl_loss = self._config.xi_kl_scale * xi_kl_loss
+                    if self._config.xi_ctx_scale > 0:
+                        xi_ctx_loss = self._context_loss(xi_post, data)
+                        xi_kl_loss = (xi_kl_loss
+                                      + self._config.xi_ctx_scale * xi_ctx_loss)
 
                 get_features_time = time.time()
                 feat = self.dynamics.get_feat(post)
                 xi_feat = self.get_xi_feat(xi_post)
                 self._add_wm_timing(time_metrics, 'get_features', time.time() - get_features_time)
 
+                decorr_loss = 0.0
+                if self._use_exo and self._config.branch_decorr_scale > 0:
+                    decorr_loss = (self._config.branch_decorr_scale
+                                   * self._branch_decorr_loss(feat, xi_feat))
+
                 # Every MI term, before the prediction losses because they may
                 # subsample feat. The estimators are stepped after the world-model
                 # optimizer -- see InfoLosses for why the two cannot be merged.
                 info_loss = self._info.compute(
-                    post, feat, xi_post, xi_feat, data, time_metrics
+                    post, feat, xi_post, xi_feat, data, time_metrics, embed
                 )
 
                 losses, mses = self._compute_prediction_losses(
-                    feat, embed, data, time_metrics, xi_feat
+                    feat, embed, data, time_metrics, xi_feat, diff_target
                 )
 
             optimizer_time = time.time()
             metrics = self._model_opt(
-                sum(losses.values()) + kl_loss + xi_kl_loss + info_loss,
+                sum(losses.values()) + kl_loss + xi_kl_loss + info_loss + decorr_loss,
                 self.parameters(),
             )
             # Only now: the bounds above hold the estimator weights in the graph,
@@ -367,6 +461,10 @@ class WorldModel(nn.Module):
             metrics["xi_dyn_loss"] = to_np(xi_dyn_loss)
             metrics["xi_rep_loss"] = to_np(xi_rep_loss)
             metrics["xi_kl"] = to_np(torch.mean(xi_kl_value))
+            if self._config.xi_ctx_scale > 0:
+                metrics["xi_ctx_loss"] = to_np(xi_ctx_loss)
+            if torch.is_tensor(decorr_loss):
+                metrics["branch_decorr_loss"] = to_np(decorr_loss)
         metrics.update(self._info.metrics())
         for name, mse in mses.items():
             metrics[f"{name}_mse"] = to_np(mse)
@@ -412,7 +510,9 @@ class WorldModel(nn.Module):
         max_pair = logits_pairs_mean.max(dim=-1)[0]
         return (logits_pairs_mean.sum(dim=-1) - max_pair).unsqueeze(-1)
 
-    def _compute_prediction_losses(self, feat, embed, data, time_metrics, xi_feat=None):
+    def _compute_prediction_losses(self, feat, embed, data, time_metrics, xi_feat=None,
+                                   diff_data=None):
+        diff_data = diff_data or {}
         preds = {}
         sequence_indices = None
 
@@ -468,11 +568,12 @@ class WorldModel(nn.Module):
                     pred = head(
                         feat_and_embed_input,
                         curr_xi.repeat(1, self._config.reconstruction_window, 1),
+                        split=self._obs_diff_split,
                     )
                 else:
                     pred = head(feat_and_embed_input)
             elif curr_xi is not None:
-                pred = head(curr_feat, curr_xi)
+                pred = head(curr_feat, curr_xi, split=self._obs_diff_split)
             elif name == "reward":
                 rf = self.reward_feat(curr_feat)
                 if reward_action is not None:
@@ -494,14 +595,23 @@ class WorldModel(nn.Module):
                 head_name, key_name = name.split(",")
             else:
                 head_name, key_name = None, name
+            # Under obs-diff split, 'exo_x' predicts the full observation and the
+            # endogenous 'x' predicts the residual it was encoded from.
+            def _target(key):
+                if key.startswith("exo_"):
+                    return data[key[4:]]
+                if self._obs_diff_split and key in diff_data:
+                    return diff_data[key]
+                return data[key]
+
             if head_name is not None and head_name.startswith("multi_"):
-                curr_data, masking = tools.window_data_repeat(data[key_name], self._config.reconstruction_window,
+                curr_data, masking = tools.window_data_repeat(_target(key_name), self._config.reconstruction_window,
                                                               sequence_indices, shift_left=True)
             elif head_name is None and key_name.startswith("multi_"):
-                curr_data, masking = tools.window_data_repeat(data[key_name[6:]], self._config.reconstruction_window,
+                curr_data, masking = tools.window_data_repeat(_target(key_name[6:]), self._config.reconstruction_window,
                                                               sequence_indices, shift_left=True)
             else:
-                curr_data = data[key_name]
+                curr_data = _target(key_name)
                 if sequence_indices is not None:
                     batch_indices = np.arange(curr_data.shape[0])[:, np.newaxis]
                     curr_data = curr_data[batch_indices, sequence_indices]

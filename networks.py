@@ -363,9 +363,12 @@ class XiRSSM(nn.Module):
         device=None,
         num_contexts=0,
         ctx_dim=16,
+        ctx_cond=True,
+        ctx_cls=False,
     ):
         super(XiRSSM, self).__init__()
-        self._ctx_dim = int(ctx_dim) if int(num_contexts) > 0 else 0
+        self._ctx_dim = (int(ctx_dim)
+                         if int(num_contexts) > 0 and ctx_cond else 0)
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
@@ -439,17 +442,29 @@ class XiRSSM(nn.Module):
             self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
             self._obs_stat_layer.apply(tools.weight_init)
 
-        # Task-conditional prior p(xi_t | xi_{t-1}, task_id); last row is unlabelled.
+        # Two independent ways to tie xi to the task, either or both:
+        #   ctx_cond -- task-conditional prior p(xi_t | xi_{t-1}, task_id); the last
+        #               embedding row is the unlabelled id.
+        #   ctx_cls  -- classifier xi_deter -> task_id, supervising the *posterior*.
+        # Conditioning alone leaves the posterior free to ignore the observation:
+        # a prior that knows the task can predict xi outright, so the KL goes to
+        # zero and xi_post drifts to uniform.
         self._num_contexts = int(num_contexts)
-        if self._num_contexts > 0:
+        if self._num_contexts > 0 and ctx_cond:
             self._ctx_emb = nn.Embedding(self._num_contexts + 1, ctx_dim)
             self._ctx_emb.apply(tools.weight_init)
+        if self._num_contexts > 0 and ctx_cls:
+            self._ctx_cls = nn.Linear(self._deter, self._num_contexts)
+            self._ctx_cls.apply(tools.weight_init)
 
         if self._initial == "learned":
             self.W = torch.nn.Parameter(
                 torch.zeros((1, self._deter), device=torch.device(self._device)),
                 requires_grad=True,
             )
+
+    def context_logits(self, state):
+        return self._ctx_cls(state["deter"])
 
     @property
     def feat_size(self):
@@ -1086,10 +1101,19 @@ class MultiDecoder(nn.Module):
                 )
         self._image_dist = image_dist
 
-    def forward(self, features, xi_features=None):
-        """Unchanged contract: a dict holding every key this decoder emits."""
-        combined, _, _ = self.forward_parts(features, xi_features)
-        return combined
+    def forward(self, features, xi_features=None, split=False):
+        """Unchanged contract: a dict holding every key this decoder emits.
+
+        With `split`, the two branches are returned as separate predictions --
+        exogenous keys prefixed 'exo_' -- instead of one distribution over their
+        sum, so each can be trained against its own target.
+        """
+        combined, endo_only, exo_only = self.forward_parts(features, xi_features)
+        if not split or exo_only is None:
+            return combined
+        out = {k: endo_only.get(k, v) for k, v in combined.items()}
+        out.update({f"exo_{k}": v for k, v in exo_only.items()})
+        return out
 
     def forward_parts(self, features, xi_features=None):
         """Decode into (combined, endo_only, exo_only), each a dict keyed as before.
@@ -1156,6 +1180,23 @@ class MultiDecoder(nn.Module):
         if not use_xi:
             return combined, None, None
         return combined, endo_only, exo_only
+
+    def branch_means(self, features, xi_features):
+        """Pre-distribution (endo_mean, exo_mean) per key, for the decorrelation
+        penalty. The decoder only ever scores their sum, so the two are free to
+        drift into large opposite-signed values that cancel -- which they do."""
+        out = {}
+        if not (self._use_xi and xi_features is not None):
+            return out
+        if self.mlp_shapes and self.xi_mlp_shapes:
+            stats = self._mlp.forward_stats(features)
+            xi_stats = self._mlp_xi.forward_stats(xi_features)
+            for name in xi_stats:
+                if name in stats:
+                    out[name] = (stats[name][0], xi_stats[name][0])
+        if self.cnn_shapes:
+            out["_cnn"] = (self._cnn(features), self._cnn_xi(xi_features))
+        return out
 
     def _make_image_dist(self, mean):
         if self._image_dist == "normal":

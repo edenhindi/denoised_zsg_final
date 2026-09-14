@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import pickle
+import random
 import sys
 import time
 
@@ -142,8 +143,10 @@ class Dreamer(nn.Module):
             latent, action = state
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
+        # Sampling the latent makes a greedy policy nondeterministic.
         latent, _ = self._wm.dynamics.obs_step(
-            latent, action, embed, obs["is_first"], self._config.collect_dyn_sample
+            latent, action, embed, obs["is_first"],
+            self._config.collect_dyn_sample and training
         )
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
@@ -254,7 +257,7 @@ def make_dataset(episodes, config):
     return dataset
 
 
-def make_env(config, mode, pool=None):
+def make_env(config, mode, pool=None, index=0):
     suite, task = config.task.split("_", 1)
     if suite == "bandits":
         import envs.bandits as bandits
@@ -276,8 +279,11 @@ def make_env(config, mode, pool=None):
                 "eval": pool.val_tasks,
                 "test": pool.test_tasks,
             }[mode]()
+        # Envs live in their own processes, so they need seeding here -- and a
+        # distinct one each, or every env draws the same task sequence.
         env = bandits.BanditEnv(generator, num_steps=config.max_episode_length,
                                 allowed_ids=allowed_ids,
+                                seed=config.seed * 1000 + index,
                                 use_distractor=config.use_distractor)
         env = wrappers.OneHotAction(env)
     elif suite == "dmc":
@@ -393,6 +399,8 @@ def main(config):
         raise ValueError("Cannot use more than one meta episode without meta learning")
 
     # Previously dead config: without this, repeats of one config were unreproducible.
+    # `random` matters too -- TaskPool shuffles with it.
+    random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
@@ -443,12 +451,14 @@ def main(config):
                        "train": [int(t) for t in pool.train_tasks()],
                        "val": [int(t) for t in pool.val_tasks()],
                        "test": [int(t) for t in pool.test_tasks()]}, f, indent=2)
-    make = lambda mode: make_env(config, mode, pool=pool)
+    # Offset the index per split so train/eval/test envs do not mirror each other.
+    make = lambda mode, i=0: make_env(config, mode, pool=pool, index=i)
     helper_env = make("eval")
-    train_envs = [make("train") for _ in range(config.envs)]
-    eval_envs = [make("eval") for _ in range(config.envs)]
+    train_envs = [make("train", i) for i in range(config.envs)]
+    eval_envs = [make("eval", 100 + i) for i in range(config.envs)]
     # Separate from eval_envs, which are restricted to val.
-    test_envs = [make("test") for _ in range(config.envs)] if pool is not None else eval_envs
+    test_envs = ([make("test", 200 + i) for i in range(config.envs)]
+                 if pool is not None else eval_envs)
     state2img = helper_env.state2image if hasattr(helper_env, "state2image") else None
     if pool is not None:
         sample_train_task = pool.sample_train

@@ -1,6 +1,8 @@
-# Five seeds of one config, to measure run-to-run spread.
+# Five seeds of the xi classifier + conditional prior config, to measure
+# run-to-run spread.
 #   wandb sweep scripts/seeds_sweep.yaml
 #   wandb agent <sweep-id>       # one agent per GPU
+#
 program: dreamer.py
 method: grid
 project: dreamer-v3
@@ -13,7 +15,7 @@ parameters:
   seed:
     values: [0, 1, 2, 3, 4]
   wandb_group:
-    value: seeds_baseline
+    value: xi_cls_cond_300k_decor
 
 # dreamer.py takes "--flag value", so this needs ${args}, not
 # ${args_no_hyphens}, and --configs must come before it.
@@ -29,6 +31,20 @@ command:
   - "True"
   - --probe_state
   - "True"
+  - --probe_early_steps
+  - "3"
+  - --reward_head_action
+  - "True"
+  - --random_until
+  - "16000"
+  - --steps
+  - "3e5"
+  - --xi_ctx_cond
+  - "True"
+  - --xi_ctx_scale
+  - "1.0"
   - --exp_label
-  - bandits_smaller_latents_xi_encoder_higherhorizon_lessentropy
+  - xi_cls_cond_300k_decor
+  - --branch_decorr_scale
+  - "1.0"
   - ${args}

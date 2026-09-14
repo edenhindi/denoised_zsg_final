@@ -45,8 +45,9 @@ becomes a `--flag`. Two consequences:
   `num_meta_episodes * max_episode_length`, overriding any YAML value (including
   `debug`'s). It must exceed `initial_wm_horizon` or `Dreamer.__init__` raises.
 - **`seed: 0` is dead config** — never read anywhere. Only the task split is seeded
-  (`task_split_seed`); network init, exploration, and env dynamics are not. Run several
-  training seeds before believing a result.
+  (`task_split_seed`); network init, exploration, and env dynamics are not. This is not
+  academic: on bandits about **one run in three** never learns explore-exploit at all
+  (see "Reading results"). Run 3+ repeats before believing anything.
 
 ## Zero-shot task split
 
@@ -109,19 +110,46 @@ random-arm reward.
 Two conditions differing in one key: `bandits` (static distractor, the pathological case)
 and `bandits bandits_drift` (drifts within the episode, harder to bind).
 
-Design points that are load-bearing:
+### What `envs/bandits.py` builds
+
+`DistractorDataset` generates everything from one seeded RNG, so a task id means the same
+task in every env. **Train and eval envs must share the generator** (`generator_seed`),
+or the split is meaningless. It holds three arrays over `num_tasks`:
+
+- `distractor_start` / `distractor_end` — with `static_distractor: True` only `start` is
+  used, constant for the whole episode; otherwise the distractor drifts linearly from one
+  to the other across the episode fraction.
+- `suboptimal_rewards` — only under `reward_mode: 'uniform'`. Under `'binary'` every
+  non-optimal arm pays exactly 0, so a confidently wrong policy scores 0.00, not
+  random-ish. That is what makes wrong-arm lock-in visible as an exact zero.
+
+The observation is `state = [distractor, prev_action_onehot, prev_reward]`, width
+`distractor_dim + num_arms + 1`. Note the previous action and reward live **inside**
+`state`, not in separate keys — so anything that masks or subtracts observation keys
+touches them too.
+
+`BanditEnv` takes `allowed_ids`, and enforces the split twice: `sample_task()` draws only
+from it, and `set_task()` raises on anything outside it. The first makes `tools.py`'s
+no-task reset path safe; the second catches driver wiring bugs.
+
+### Load-bearing design points
 
 - `optimal_arm = task_id % num_arms`, so **arms are shared across the split** — every arm
   is optimal for some train task and some test task. A test task's answer is always
   reachable by exploration, so only a memorizing agent fails. **Do not split by arm**:
   that would make test tasks unsolvable even for a perfect explorer and prove nothing.
-- **Every split must be large enough to cover the arms.** The same `task_id % num_arms`
-  means a split of fewer than `num_arms` tasks *cannot* contain all arms, and one of a few
-  multiples of it will cover them lopsidedly. This bit once already: a 4-task val set drew
-  ids `[19, 8, 17, 2]` → optimal arms `[2, 2, 3, 4]`, so arm 2 was half of val and arms 0
-  and 1 were absent. A policy that always picked arm 2 scored optimal on half of val, and
-  never selecting arms 0 or 1 was undetectable. Keep each split at several × `num_arms`
-  and check the per-arm counts after changing any size or the seed.
+- The same `task_id % num_arms` gives a **probe ceiling**: with 20 train tasks and 5 arms
+  there are 4 tasks per arm, so an agent that knows only the arm can score at most
+  **1/4 = 0.25** on a task-id probe. Anything above that is non-behavioral information,
+  i.e. the distractor. This is a sharper test than any MI bound — no estimator, no fit
+  diagnostic, and late accuracy alone is diagnostic.
+- **Every split must be large enough to cover the arms.** A split of fewer than `num_arms`
+  tasks *cannot* contain all arms, and one of a few multiples of it will cover them
+  lopsidedly. This bit once already: a 4-task val set drew ids `[19, 8, 17, 2]` → optimal
+  arms `[2, 2, 3, 4]`, so arm 2 was half of val and arms 0 and 1 were absent. A policy
+  that always picked arm 2 scored optimal on half of val, and never selecting arms 0 or 1
+  was undetectable. Keep each split at several × `num_arms` and check the per-arm counts
+  after changing any size or the seed.
 - `num_meta_episodes: 1` is correct here, but not because adaptation is removed — one
   bandit episode *is* the explore/exploit trial. `meta_learning: True` must stay on:
   `MetaLearningEnv` is the only wrapper whose `reset()` accepts a task, and turning it off
@@ -130,6 +158,41 @@ Design points that are load-bearing:
 - `is_terminal` stays **False even on the final step** — episodes end on the step budget,
   not on failure. `models.py` turns `is_terminal` into the `cont` signal, so marking a
   time-limit truncation terminal would tell the world model that value stops there.
+- `--use_distractor False` is the control: it zeros the distractor everywhere, train
+  included, so the shortcut cannot exist and exploration is the only route. Use it as the
+  ceiling any distractor-present run is measured against.
+
+### Making the exogenous stream carry the distractor
+
+Closed as of 2026-09-13: ~17.75 out of an 18 ceiling *with* the distractor, against 17.55
+for the `--use_distractor False` control. The fix was two knobs **together**:
+
+```
+--xi_ctx_scale 1.0 --xi_ctx_cond True
+```
+
+- `xi_ctx_cond` conditions the xi **prior** on `task_id`.
+- `xi_ctx_scale` weights a classifier from `xi_deter` to `task_id`, supervising the
+  **posterior**.
+
+Neither alone works, and the reason is specific to this env. With `static_distractor:
+True`, xi is a deterministic function of `task_id`, so `H(xi | task) = 0` — a
+task-conditional prior can predict xi outright, the posterior matches it at zero KL cost,
+and xi collapses to uniform (`xi_kl ≈ 0.00`, `xi_post_ent` near its `4·ln(16) = 11.09`
+ceiling) while carrying nothing. The classifier forces the posterior to *infer* the task
+from the observation instead. Healthy values: `xi_post_ent` ~1.2 **below** `xi_prior_ent`
+~1.8, and `xi_ctx_loss` well under chance `ln(task_train_size)`.
+
+Commit `d1e9f56` swapped the classifier out for the conditioning; it was restored
+2026-09-13 as an independent knob, so either or both can run.
+
+**Directions already tried that did not work** (see `progress.md` runs #7-#15 for detail):
+CLUB on I(z; xi) at `feat`/`logit`/`deter` — each moved the shortcut rather than removing
+it, and #10 is the clean counterexample (`club_mi` fell to 0.026 while the deter arm probe
+*rose* to 0.82/0.99). Also: `endo_obs_diff` residual encoding, the split decoder,
+narrowing `dyn_stoch`, and `actor_input: stoch` — that last one fails because
+`dyn_temp_post: True` computes `stoch` from `deter`, so restricting the actor does not
+isolate it.
 
 ### Reading results
 
@@ -145,6 +208,19 @@ agent never learned explore-exploit — that looks identical to perfect generali
 the default 60-task/5-arm/20-step setup the reference points are roughly: random ≈ 4,
 always-wrong-arm ≈ 0, oracle = 20.
 
+**One run is not a result.** Twelve August 2026 runs at 500k frames, same config family,
+gave train returns of 19, 17, 20, **5**, 19, 19, **3**, 20, **0**, 19, 19, **0** — a third
+never learned. Two of the failures had `generalization_gap` near zero (0.0 train / 12.40
+eval), which is exactly the trap above. `seed: 0` is dead config, so nothing but the task
+split is seeded and these are genuinely independent draws. Run 3+ repeats per condition,
+and share a `wandb_group` so they aggregate.
+
+`scripts/print_obs_pred.py <logdir>` prints per-dimension truth vs endogenous vs exogenous
+reconstruction for one key. Use it when `state_mse` looks wrong: the logged number is an
+L2 norm over all 14 dims at once and cannot say *which* are failing. It is what showed the
+two decoder branches cancelling (endo −1.82, exo +2.09, truth 0.24) — a sum that
+reconstructs correctly while neither branch means anything.
+
 **Per-episode return spread is mostly exploration cost, not measurement noise.** With 20
 binary-reward steps, an episode that identifies the arm on step 2 scores ~18 while one
 that takes until step 6 scores ~14 — same policy, same task. That spread is real agent
@@ -155,7 +231,9 @@ and never recovering — so plot the histogram before concluding anything.
 
 The effect is not guaranteed by the design: memorizing the distractors has to be *easier*
 than learning to explore, which depends on `distractor_dim` and `task_pool_size`. If the
-gap is small, check train return first, then raise `distractor_dim`.
+gap is small, check train return first, then raise `distractor_dim` — and check whether
+the exogenous knobs above are on, since a small gap is now the *intended* outcome rather
+than a sign the setup is broken.
 
 The test set is 20 tasks, so variance is between-task and does not shrink with
 `test_episode_num`. Report per-task means and a between-task standard error; a pooled std
