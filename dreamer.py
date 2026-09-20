@@ -437,8 +437,7 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
-    # Tasks are sampled and partitioned here, from config alone -- the envs are
-    # handed a task config per episode and generate nothing themselves.
+
     tasks = None
     if config.task_split:
         tasks = task_sampler.TaskSampler(
@@ -506,6 +505,7 @@ def main(config):
             limit=config.dataset_size,
             state2image=state2img,
             num_meta_episodes=config.num_meta_episodes,
+            metric_prefix="prefill",
             fallback_task=prefill_tasks[0],
         )
         logger.step += steps_taken * config.action_repeat

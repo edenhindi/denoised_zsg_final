@@ -64,13 +64,16 @@ class Logger:
         wandb.log({name: value, "env_step": self.step}, commit=False)
 
     def image(self, name, value):
-        wandb.log({name: wandb.Image(value), "env_step": self.step})
+        # commit=False so this joins the pending row rather than flushing it:
+        # a commit here splits scalars logged either side of it across two
+        # wandb steps (this is what dropped most of the per-task return series).
+        wandb.log({name: wandb.Image(value), "env_step": self.step}, commit=False)
 
     def video(self, name, value):
         wandb.log({
             name: wandb.Video(value[0].transpose(0, 3, 1, 2)),
             "env_step": self.step,
-        })
+        }, commit=False)
 
     def write(self, fps=False):
         metrics = {'agent_frames': self.get_agent_frames()}
@@ -138,7 +141,14 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
             t["reward"] = 0.0
             t["discount"] = 1.0
             try:
-                t["task_id"] = np.array(int(envs[env_index].get_task()), dtype=np.int64)
+                # Under Parallel (envs > 1) attribute access returns a promise, so
+                # get_task() yields a callable to resolve rather than the id itself;
+                # under Damy it is already the id. int() on the unresolved promise
+                # raised TypeError into the except below, labelling every episode -1.
+                task_id = envs[env_index].get_task()
+                if callable(task_id):
+                    task_id = task_id()
+                t["task_id"] = np.array(int(task_id), dtype=np.int64)
             except (AttributeError, TypeError, ValueError):
                 t["task_id"] = np.array(-1, dtype=np.int64)
             if is_meta:
@@ -266,9 +276,16 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
         else:
             logger.scalar(f"{metric_prefix}_return", score)
         # Per-task series: the mean hides whether a low eval is every task
-        # scoring badly or a few at zero.
-        for task, task_score in sorted(eval_task_scores, key=lambda x: str(x[0])):
-            logger.scalar(f"{metric_prefix}_return/task{task}", task_score)
+        # scoring badly or a few at zero. With eval_repeats > 1 a task id
+        # appears once per repeat; they share a wandb key, so average the
+        # repeats instead of letting the last write win.
+        task_score_groups = {}
+        for task, task_score in eval_task_scores:
+            task_score_groups.setdefault(task, []).append(task_score)
+        for task in sorted(task_score_groups, key=str):
+            scores = task_score_groups[task]
+            logger.scalar(f"{metric_prefix}_return/task{task}",
+                          sum(scores) / len(scores))
         logger.scalar(f"{metric_prefix}_length", length)
         logger.scalar(
             f"{metric_prefix}_episodes", episode_num
