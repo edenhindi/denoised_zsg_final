@@ -11,8 +11,10 @@ defaults:
   seed: 0
   steps: 1e6
   eval_every_collection_episodes: 200
-  eval_episode_num: 20
-  test_episode_num: 1000
+  # Episodes per held-out task, not totals: eval and test run every task in their
+  # split this many times, so coverage is balanced by construction.
+  eval_repeats: 1
+  test_repeats: 10
   log_every: 1e4
   log_imagined_horizon_effective_length: False
   reset_every: 0
@@ -45,12 +47,12 @@ defaults:
   # config keeps its current behavior.
   task_split: False
   task_split_seed: 0
-  task_pool_size: 60
+  # Absolute task counts, not fractions. The dataset is exactly their sum, sampled
+  # in order, so train ids are 0..task_train_size-1 -- which is what xi's context
+  # classifier indexes (ids outside that range are treated as unlabelled).
   task_train_size: 20
   task_val_size: 20
   task_test_size: 20
-  # Contiguous ids per split, so train ids are dense class indices for xi's classifier.
-  task_split_contiguous: True
 
   # Model
   rnn_detach_every: -1
@@ -92,7 +94,8 @@ defaults:
   xi_dyn_scale: 0.5
   xi_rep_scale: 0.1
   # Task-conditional xi prior p(xi_t | xi_{t-1}, task_id), replacing the old context
-  # classifier. Needs task_split_contiguous and labelled task_ids.
+  # classifier. Needs train task ids 0..task_train_size-1, which the ordered
+  # split guarantees, and labelled task_ids.
   xi_ctx_cond: True
   xi_ctx_dim: 16
   # Classifier xi_deter -> task_id, added to the loss. Supervises the *posterior*,
@@ -354,7 +357,6 @@ rooms:
   encoder: { mlp_keys: '.*', cnn_keys: None, mlp_layers: 4 }
   decoder: { mlp_keys: '.*', cnn_keys: None, mlp_layers: 4 }
   logdir: ./rooms
-  eval_episode_num: 100
   imag_gradient: 'reinforce'
   actor_dist: 'onehot'
   train_ratio: 0.1
@@ -433,11 +435,10 @@ bandits:
   num_meta_episodes: 1
   meta_learning: True
   task_split: True
-  # 20/20/20 over 60 tasks. optimal_arm is task_id % num_arms, so a 4-task val
-  # set could not cover 5 arms: the old split put half of val on arm 2 and never
-  # exercised arms 0 or 1, letting a constant policy look good on val.
-  eval_episode_num: 20
-  test_episode_num: 200
+  # 20/20/20 over 60 tasks. optimal_arm is index % num_arms, so each split of 20
+  # holds exactly 4 tasks per arm -- a 4-task val set could not cover 5 arms, and
+  # the old split put half of val on arm 2 while never exercising arms 0 or 1.
+  test_repeats: 10
   prefill: 8
   num_arms: 5
   distractor_dim: 8

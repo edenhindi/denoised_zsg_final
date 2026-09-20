@@ -23,7 +23,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import exploration as expl
 import models
 import tools
-import task_split
+import task_sampler
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 
@@ -257,33 +257,15 @@ def make_dataset(episodes, config):
     return dataset
 
 
-def make_env(config, mode, pool=None, index=0):
+def make_env(config, mode, index=0):
     suite, task = config.task.split("_", 1)
     if suite == "bandits":
         import envs.bandits as bandits
 
-        generator = bandits.DistractorDataset(
-            num_tasks=config.task_pool_size,
-            num_arms=config.num_arms,
-            distractor_dim=config.distractor_dim,
-            seed=config.generator_seed,
-            reward_mode=config.reward_mode,
-            static_distractor=config.static_distractor,
-        )
-        # One list per split, never the val+test union: surplus envs reset with
-        # no task and fall through to sample_task(), which draws from allowed_ids.
-        allowed_ids = None
-        if pool is not None:
-            allowed_ids = {
-                "train": pool.train_tasks,
-                "eval": pool.val_tasks,
-                "test": pool.test_tasks,
-            }[mode]()
-        # Envs live in their own processes, so they need seeding here -- and a
-        # distinct one each, or every env draws the same task sequence.
-        env = bandits.BanditEnv(generator, num_steps=config.max_episode_length,
-                                allowed_ids=allowed_ids,
-                                seed=config.seed * 1000 + index,
+        # No task state to seed: the env is handed the exact task config to run.
+        env = bandits.BanditEnv(num_arms=config.num_arms,
+                                distractor_dim=config.distractor_dim,
+                                num_steps=config.max_episode_length,
                                 use_distractor=config.use_distractor)
         env = wrappers.OneHotAction(env)
     elif suite == "dmc":
@@ -375,6 +357,30 @@ def make_env(config, mode, pool=None, index=0):
     return env
 
 
+def make_sampler(config):
+    """The env's task sampler: one task config per call.
+
+    Envs own what a task contains; this only routes by suite. Paired with
+    task_sampler.TaskSampler, which assigns ids and partitions the dataset.
+    """
+    suite = config.task.split("_", 1)[0]
+    if suite == "bandits":
+        import envs.bandits as bandits
+        return bandits.make_sampler(config)
+    if suite == "dmc":
+        import envs.dmc_meta as dmc_meta
+        return dmc_meta.make_sampler(config)
+    raise NotImplementedError(f"no task sampler for suite {suite!r}")
+
+
+def _json_default(o):
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):
+        return o.item()
+    raise TypeError(f"cannot serialize task component of type {type(o)}")
+
+
 def main(config):
     curr_log_file = pathlib.Path(
         datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S") + "_" + hashlib.sha256(str(config).encode()).hexdigest())
@@ -399,7 +405,6 @@ def main(config):
         raise ValueError("Cannot use more than one meta episode without meta learning")
 
     # Previously dead config: without this, repeats of one config were unreproducible.
-    # `random` matters too -- TaskPool shuffles with it.
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -432,50 +437,39 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
-    # The split has to exist before the envs, since each env is constructed with
-    # the ids it is allowed to use.
-    pool = None
+    # Tasks are sampled and partitioned here, from config alone -- the envs are
+    # handed a task config per episode and generate nothing themselves.
+    tasks = None
     if config.task_split:
-        pool = task_split.TaskPool(
-            exhaustive_fn=lambda: list(range(config.task_pool_size)),
+        tasks = task_sampler.TaskSampler(
+            make_sampler(config),
             train_size=config.task_train_size,
             val_size=config.task_val_size,
             test_size=config.task_test_size,
             seed=config.task_split_seed,
-            contiguous=config.task_split_contiguous,
         )
-        described = task_split.describe_pool(pool)
+        described = task_sampler.describe_split(tasks)
         print(f"Task split: {described}")
         with open(logdir / "task_split.json", "w") as f:
             json.dump({**described,
-                       "train": [int(t) for t in pool.train_tasks()],
-                       "val": [int(t) for t in pool.val_tasks()],
-                       "test": [int(t) for t in pool.test_tasks()]}, f, indent=2)
-    # Offset the index per split so train/eval/test envs do not mirror each other.
-    make = lambda mode, i=0: make_env(config, mode, pool=pool, index=i)
+                       "train": tasks.train_tasks(),
+                       "val": tasks.val_tasks(),
+                       "test": tasks.test_tasks()},
+                      f, indent=2, default=_json_default)
+    make = lambda mode, i=0: make_env(config, mode, index=i)
     helper_env = make("eval")
     train_envs = [make("train", i) for i in range(config.envs)]
+    # Eval and test share a fleet: with tasks supplied per episode, an env is not
+    # bound to a split.
     eval_envs = [make("eval", 100 + i) for i in range(config.envs)]
-    # Separate from eval_envs, which are restricted to val.
-    test_envs = ([make("test", 200 + i) for i in range(config.envs)]
-                 if pool is not None else eval_envs)
     state2img = helper_env.state2image if hasattr(helper_env, "state2image") else None
-    if pool is not None:
-        sample_train_task = pool.sample_train
-        sample_val_task = pool.sample_val
-        sample_test_task = pool.sample_test
-    else:
-        sample_task = lambda: helper_env.sample_task() if config.meta_learning else None
-        sample_train_task = sample_val_task = sample_test_task = sample_task
     if config.envs > 1:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]
-        test_envs = ([Parallel(env, "process") for env in test_envs]
-                     if pool is not None else eval_envs)
     else:
         train_envs = [Damy(env) for env in train_envs]
         eval_envs = [Damy(env) for env in eval_envs]
-        test_envs = [Damy(env) for env in test_envs] if pool is not None else eval_envs
+    test_envs = eval_envs
     acts = helper_env.action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
@@ -498,10 +492,9 @@ def main(config):
         return {"action": action, "logprob": logprob}, None
 
     if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
-        print(f"Prefill dataset ({prefill} episodes).")
+        print(f"Prefill dataset ({config.prefill} episodes).")
 
-        prefill_tasks = [sample_train_task() for _ in range(config.prefill)]
+        prefill_tasks = [tasks.sample_train_task() for _ in range(config.prefill)]
         _, steps_taken, _ = tools.simulate(
             random_agent,
             train_envs,
@@ -513,6 +506,7 @@ def main(config):
             limit=config.dataset_size,
             state2image=state2img,
             num_meta_episodes=config.num_meta_episodes,
+            fallback_task=prefill_tasks[0],
         )
         logger.step += steps_taken * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
@@ -534,17 +528,12 @@ def main(config):
 
     eval_scheduler = tools.Every(config.eval_every_collection_episodes)
     collected_episodes = 0
-    # Fixed across evaluations, so best_return comparisons over training are
-    # measuring the model rather than the task draw. Sampled without replacement
-    # so a small val pool is covered evenly.
-    if pool is not None:
-        eval_tasks = pool.sample_val_batch(config.eval_episode_num)
-        # Held-out return is only interpretable next to seen-task return under the
-        # same policy, so evaluate a matched set of train tasks too.
-        train_eval_tasks = pool.sample_train_batch(config.eval_episode_num)
-    else:
-        eval_tasks = [sample_val_task() for _ in range(config.eval_episode_num)]
-        train_eval_tasks = None
+    # The whole val split, every task eval_repeats times: eval-to-eval movement is
+    # then the model rather than the task draw, and per-task means stay balanced.
+    eval_tasks = tasks.val_tasks() * config.eval_repeats
+    # Held-out return is only interpretable next to seen-task return under the
+    # same policy, so evaluate a matched set of train tasks too.
+    train_eval_tasks = tasks.train_tasks() * config.eval_repeats
     training_times = []
     best_return = -np.inf
     eval_policy = functools.partial(agent, training=False)
@@ -563,25 +552,26 @@ def main(config):
                 is_eval=True,
                 state2image=state2img,
                 num_meta_episodes=config.num_meta_episodes,
+                fallback_task=eval_tasks[0],
             )
-            if train_eval_tasks is not None:
-                # Same policy, same episode count, seen tasks: the difference is
-                # attributable to task familiarity rather than to policy mode.
-                _, _, train_eval_return = tools.simulate(
-                    eval_policy,
-                    eval_envs if pool is None else train_envs,
-                    train_eval_tasks,
-                    eval_eps,
-                    config.evaldir,
-                    logger,
-                    is_eval=True,
-                    state2image=state2img,
-                    num_meta_episodes=config.num_meta_episodes,
-                    # Without its own prefix this pass overwrites the val pass's
-                    # eval_* keys at the same env_step.
-                    metric_prefix="train_eval",
-                )
-                logger.scalar("generalization_gap", train_eval_return - eval_return)
+            # Same policy, same episode count, seen tasks: the difference is
+            # attributable to task familiarity rather than to policy mode.
+            _, _, train_eval_return = tools.simulate(
+                eval_policy,
+                train_envs,
+                train_eval_tasks,
+                eval_eps,
+                config.evaldir,
+                logger,
+                is_eval=True,
+                state2image=state2img,
+                num_meta_episodes=config.num_meta_episodes,
+                # Without its own prefix this pass overwrites the val pass's
+                # eval_* keys at the same env_step.
+                metric_prefix="train_eval",
+                fallback_task=train_eval_tasks[0],
+            )
+            logger.scalar("generalization_gap", train_eval_return - eval_return)
             if eval_return > best_return:
                 best_return = eval_return
                 torch.save(agent.state_dict(), logdir / "best_model.pt")
@@ -594,7 +584,7 @@ def main(config):
             training_times.clear()
         dreamer_training_time = time.time()
         print("Start training.")
-        train_tasks = [sample_train_task() for _ in range(config.envs)]
+        train_tasks = [tasks.sample_train_task() for _ in range(config.envs)]
         # Collect with a uniform-random policy until random_until frames. The world
         # model still trains below, so its early gradients come from data where the
         # arm pulled is independent of the distractor.
@@ -608,7 +598,8 @@ def main(config):
             logger,
             is_eval=False,
             limit=config.dataset_size,
-            num_meta_episodes=config.num_meta_episodes
+            num_meta_episodes=config.num_meta_episodes,
+            fallback_task=train_tasks[0],
         )
         collected_episodes += config.envs
         logger.step += steps_taken * config.action_repeat
@@ -619,10 +610,14 @@ def main(config):
         training_times.append(time.time() - dreamer_training_time)
 
     agent.load_state_dict(torch.load(logdir / "best_model.pt"), strict=False)
+    # Every test task test_repeats times: balanced coverage, so per-task means and
+    # a between-task standard error are computable. Variance here is between-task
+    # and does not shrink with repeats.
+    test_tasks = tasks.test_tasks() * config.test_repeats
     _, _, test_return = tools.simulate(
         eval_policy,
         test_envs,
-        [sample_test_task() for _ in range(config.test_episode_num)],
+        test_tasks,
         eval_eps,
         config.evaldir,
         logger,
@@ -630,10 +625,11 @@ def main(config):
         state2image=state2img,
         num_meta_episodes=config.num_meta_episodes,
         metric_prefix="test",
+        fallback_task=test_tasks[0],
     )
     print(f"Test return: {test_return:.1f}.")
 
-    for env in train_envs + eval_envs + (test_envs if pool is not None else []):
+    for env in train_envs + eval_envs:
         try:
             env.close()
         except Exception:

@@ -28,6 +28,22 @@ class HyperXGoalDist(distributions.Distribution):
         return ret_call
 
 
+def make_sampler(config):
+    """One goal-task config per call, for TaskSampler.
+
+    Seeded from task_split_seed so the task set is reproducible across runs --
+    dm_control's own goal sampling draws from unseeded global numpy. `index` is
+    unused here: unlike bandits, nothing about a goal task depends on its position
+    in the dataset.
+    """
+    rng = np.random.RandomState(config.task_split_seed)
+    goal = HyperXGoalDist(theta=config.goal_dist_theta,
+                          radius=config.goal_dist_radius)(rng)
+    # goal_radius is fixed per embodiment (set where the task is registered), so it
+    # is not part of what varies across tasks; set_task keeps whatever the env has.
+    return lambda index: {"goal_poses": [goal() for _ in range(config.num_goals)]}
+
+
 class DMCMetaEnv(control.Environment):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -139,7 +155,9 @@ class AbstractGoalMeta(ABC):
 
     def set_task(self, task: Dict):
         self._all_goal_poses = task["goal_poses"]
-        self.goal_radius = task["goal_radius"]
+        # Absent from sampled tasks: the radius is fixed per embodiment, not part
+        # of what varies across tasks.
+        self.goal_radius = task.get("goal_radius", self.goal_radius)
 
     def sample_task(self):
         return {"goal_poses": self._sample_goal(), "goal_radius": self.goal_radius}

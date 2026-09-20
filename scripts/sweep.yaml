@@ -1,5 +1,5 @@
-# Five seeds of the xi classifier + conditional prior config, to measure
-# run-to-run spread.
+# Grid over batch_size x branch_decorr_scale x five seeds, on the xi classifier +
+# conditional prior config, to measure run-to-run spread.
 #   wandb sweep scripts/seeds_sweep.yaml
 #   wandb agent <sweep-id>       # one agent per GPU
 #
@@ -12,10 +12,14 @@ metric:
   goal: maximize
 
 parameters:
+  batch_size:
+    values: [16]
+  branch_decorr_scale:
+    values: [0.5]
   seed:
     values: [0, 1, 2, 3, 4]
   wandb_group:
-    value: xi_cls_cond_300k_decor
+    value: xi_cls_cond_100k_sweep_batch_size_branch_decorr_scale
 
 # dreamer.py takes "--flag value", so this needs ${args}, not
 # ${args_no_hyphens}, and --configs must come before it.
@@ -38,13 +42,13 @@ command:
   - --random_until
   - "16000"
   - --steps
-  - "3e5"
+  - 100000
   - --xi_ctx_cond
   - "True"
   - --xi_ctx_scale
   - "1.0"
   - --exp_label
-  - xi_cls_cond_300k_decor
-  - --branch_decorr_scale
-  - "1.0"
+  - xi_cls_cond_100k_decor_reward_head_task
+  - --kl_free
+  - "0.5"
   - ${args}

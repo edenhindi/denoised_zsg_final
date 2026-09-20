@@ -91,7 +91,7 @@ class Logger:
 
 
 def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=None, state2image=None,
-             num_meta_episodes=1, metric_prefix="eval"):
+             num_meta_episodes=1, metric_prefix="eval", fallback_task=None):
     is_meta = num_meta_episodes > 1
     total_env_steps = 0
     completed_tasks = []
@@ -115,8 +115,12 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
         for env_index in range(len(envs)):
             if done[env_index]:
                 if len(tasks_left) == 0:
-                    # reset with some dummy task
-                    reset_results.append(envs[env_index].reset())
+                    # Surplus env: more envs than tasks left. This episode is
+                    # discarded (no entry in env_index_to_ongoing_tasks, so it is
+                    # not cached, saved or scored), but it must still stay inside
+                    # the caller's split -- the env cannot sample a task of its
+                    # own, and a held-out task here would reach the train buffer.
+                    reset_results.append(envs[env_index].reset(fallback_task))
                 else:
                     # reset with a task
                     task = tasks_left.pop()
@@ -208,8 +212,11 @@ def simulate(agent, envs, tasks, cache, directory, logger, is_eval=False, limit=
                                                                                    cache, num_meta_episodes)
                         eval_scores.append(score)
                         eval_lengths.append(length)
-                        # Episodes finish in env order, not task order.
-                        eval_task_scores.append((task, score))
+                        # Episodes finish in env order, not task order. Key the
+                        # series by the task's id -- already recorded on every
+                        # transition -- so the metric reads task3 rather than the
+                        # config dict the env was reset with.
+                        eval_task_scores.append((int(episode[0]["task_id"]), score))
                         if is_meta:
                             for j in range(len(scores_per_episode)):
                                 scores_per_episode[j].append(score_per_episode[j])

@@ -162,7 +162,9 @@ class TimeAugmentedState(gym.Wrapper):
 class MetaLearningEnv(gym.Wrapper):
     def __init__(self, env, num_meta_episodes, max_episode_length):
         super().__init__(env)
-        mandatory_functions = ["get_task", "set_task", "sample_task", "reset_model"]
+        # No sample_task: tasks come from the driver, which holds the split. An env
+        # that could sample its own task could reach outside that split.
+        mandatory_functions = ["get_task", "set_task", "reset_model"]
         for function in mandatory_functions:
             if not hasattr(env, function):
                 raise ValueError(f"Cannot use meta learning mode, the environment does not have a {function} function.")
@@ -176,8 +178,8 @@ class MetaLearningEnv(gym.Wrapper):
         return self.env.get_task()
 
     def _set_task(self, task):
-        task = task if task is not None else self.sample_task()
-        self.env.set_task(task)
+        if task is not None:
+            self.env.set_task(task)
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
@@ -194,12 +196,10 @@ class MetaLearningEnv(gym.Wrapper):
     def reset(self, task=None):
         self._current_step = 0
         self._current_episode = 0
-        task = task if task is not None else self.sample_task()
+        # task=None keeps whatever task the env already holds and just restarts the
+        # trial; the driver always supplies one for episodes it scores.
         self._set_task(task)
         return self.env.reset(task)
-
-    def sample_task(self):
-        return self.env.sample_task()
 
     def reset_model(self):
         self._current_step = 0
