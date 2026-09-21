@@ -472,6 +472,19 @@ bandits_drift:
   logdir: ./bandits_drift
   static_distractor: False
 
+# The denoising method, on. Four mechanisms that only produce the result together
+# -- each is documented at its default in `defaults`, and each stays independently
+# overridable from the CLI. Env-agnostic: compose it with any env block.
+#   --configs bandits denoised --task bandits_distractor
+# Needs labelled task_ids, i.e. task_split: True and train ids 0..task_train_size-1.
+denoised:
+  use_exo: True
+  xi_ctx_cond: True
+  xi_ctx_scale: 1.0
+  branch_decorr_scale: 1.0
+  reward_head_action: True
+  reward_head_task: True
+
 debug:
   debug: True
   pretrain: 1
