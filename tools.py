@@ -71,7 +71,7 @@ class Logger:
 
     def video(self, name, value):
         wandb.log({
-            name: wandb.Video(value[0].transpose(0, 3, 1, 2)),
+            name: wandb.Video(value[0].transpose(0, 3, 1, 2), format="mp4"),
             "env_step": self.step,
         }, commit=False)
 
@@ -1017,31 +1017,41 @@ def tensorstats(tensor, prefix=None):
 def window_data_repeat(data: torch.Tensor, window_size: int, sequence_indices: Optional[torch.Tensor], shift_left:bool=False) -> Tuple[torch.Tensor, torch.Tensor]:
     # note, data should be a continuous sequence, i.e. no skipping elements by sampling
     assert window_size % 2 == 1, "window_size must be odd"
-    # data: (batch_size, seq_len, embed_size)
+    # data: (batch_size, seq_len, *obs_shape). obs_shape is a single embed_size for
+    # vector observations and (H, W, C) for images, so everything below indexes the
+    # leading (batch, seq) axes only and keeps the observation shape opaque -- the
+    # mask travels as its own tensor rather than as an extra feature channel, which
+    # would be meaningless for a pixel grid.
+    obs_shape = data.shape[2:]
     padding = (window_size - 1) // 2
-    padding_data = data[:, 0, :].unsqueeze(1).repeat(1, padding, 1)
-    # create masks, same size as the data, expect the last dimension is 1
-    padding_mask = torch.zeros(list(padding_data.shape[:2]) + [1], dtype=padding_data.dtype, device=padding_data.device)
-    data_mask = torch.ones(list(data.shape[:2]) + [1], dtype=data.dtype, device=data.device)
-    # concatenate the masks to the data (adding a feature in the last dimension)
-    padding_data = torch.cat([padding_mask, padding_data], dim=-1)
-    data = torch.cat([data_mask, data], dim=-1)
-    # concatenate the data with padding
-    padded_embed = torch.cat([padding_data, data, padding_data], dim=1)  # (batch_size, seq_len + 2*padding, embed_size + 1)
+    # Edge padding repeats the first frame, as before.
+    padding_data = data[:, :1].repeat(1, padding, *([1] * len(obs_shape)))
+    # 1 for real frames, 0 for padded ones; one scalar per (batch, seq) position.
+    padding_mask = torch.zeros(padding_data.shape[:2], dtype=data.dtype, device=data.device)
+    data_mask = torch.ones(data.shape[:2], dtype=data.dtype, device=data.device)
+    # concatenate the data with padding on both sides
+    padded_embed = torch.cat([padding_data, data, padding_data], dim=1)
+    padded_mask = torch.cat([padding_mask, data_mask, padding_mask], dim=1)
     if shift_left:
-        # Shift the padded data to the left by one, and correcting the mask
-        padded_embed[:, padding, 0] = 0
-        shifted_padded_embed = padded_embed[:, 1:]
-        padded_embed = torch.cat([shifted_padded_embed, padded_embed[:, -1:]], dim=1)
-    # unfold the padded data to get the windowed data
-    windowed_embed = padded_embed.unfold(1, window_size, 1).permute(0, 1, 3, 2)  # (batch_size, seq_len, window_size, embed_size + 1)
+        # Shift the padded data to the left by one, and correct the mask. The mask
+        # write now lands on its own tensor instead of channel 0 of the data.
+        padded_mask[:, padding] = 0
+        padded_embed = torch.cat([padded_embed[:, 1:], padded_embed[:, -1:]], dim=1)
+        padded_mask = torch.cat([padded_mask[:, 1:], padded_mask[:, -1:]], dim=1)
+    # unfold over the sequence axis -> (batch, seq_len, window_size, *obs_shape).
+    # unfold appends the window axis last, so move it back next to seq_len.
+    windowed_embed = padded_embed.unfold(1, window_size, 1)
+    windowed_embed = windowed_embed.movedim(-1, 2)
+    windowed_mask = padded_mask.unfold(1, window_size, 1)
     # subsample the sequences
     if sequence_indices is not None:
         batch_indices = np.arange(data.shape[0])[:, np.newaxis]
         windowed_embed = windowed_embed[batch_indices, sequence_indices]
-    windowed_embed = windowed_embed.reshape(-1, windowed_embed.shape[1] * windowed_embed.shape[2], windowed_embed.shape[3])  # (batch_size, seq_len * window_size, embed_size + 1)
-    # split the windowed data into data and mask
-    windowed_data = windowed_embed[:, :, 1:]
-    windowed_mask = windowed_embed[:, :, :1]
+        windowed_mask = windowed_mask[batch_indices, sequence_indices]
+    # flatten seq_len and window_size into one axis, keeping obs_shape intact
+    windowed_data = windowed_embed.reshape(
+        windowed_embed.shape[0], windowed_embed.shape[1] * windowed_embed.shape[2], *obs_shape)
+    windowed_mask = windowed_mask.reshape(
+        windowed_mask.shape[0], windowed_mask.shape[1] * windowed_mask.shape[2], 1)
 
     return windowed_data, windowed_mask

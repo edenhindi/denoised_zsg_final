@@ -277,6 +277,22 @@ def make_env(config, mode, index=0):
                                 num_steps=config.max_episode_length,
                                 use_distractor=config.use_distractor)
         env = wrappers.OneHotAction(env)
+    elif suite == "minigrid":
+        import envs.minigrid_confound as minigrid_confound
+
+        # No task state to seed: the env is handed the exact task config to run.
+        env = minigrid_confound.MiniGridConfound(
+            layout=minigrid_confound.make_layout(
+                config.minigrid_layout, config.minigrid_size),
+            num_steps=config.max_episode_length,
+            size=config.size,
+            use_distractor=config.use_distractor,
+            distractor_strength=config.distractor_strength,
+            hide_goal=config.hide_goal,
+            fixed_start=config.fixed_start,
+            partial_obs=config.partial_obs,
+        )
+        env = wrappers.OneHotAction(env)
     elif suite == "dmc":
         import envs.dmc as dmc
         if config.meta_learning:
@@ -376,6 +392,9 @@ def make_sampler(config):
     if suite == "bandits":
         import envs.bandits as bandits
         return bandits.make_sampler(config)
+    if suite == "minigrid":
+        import envs.minigrid_confound as minigrid_confound
+        return minigrid_confound.make_sampler(config)
     if suite == "dmc":
         import envs.dmc_meta as dmc_meta
         return dmc_meta.make_sampler(config)

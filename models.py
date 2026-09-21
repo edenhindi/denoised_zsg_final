@@ -12,6 +12,18 @@ import tools
 to_np = lambda x: x.detach().cpu().numpy()
 
 
+def _broadcast_mask(mask, target):
+    """Shape a (batch, seq, 1) per-frame mask to multiply `target`.
+
+    `target` is (batch, seq) for vector heads, whose log_prob/mse sum over the
+    feature axis, and (batch, seq, H, W) for CNN heads, which keep the spatial
+    dims. Squeezing the trailing 1 and appending one axis per extra target dim
+    leaves the mask broadcastable in both cases.
+    """
+    mask = mask[..., 0]
+    return mask.reshape(mask.shape + (1,) * (target.dim() - mask.dim()))
+
+
 class RewardEMA(object):
     """running mean and std"""
 
@@ -645,8 +657,13 @@ class WorldModel(nn.Module):
                 # note, we don't have to count the mean with exactly the same number of elements as the masking,
                 # because the window size if fixed so the number of zeroed elements is fixed, therefore it is
                 # like multiplying by a constant which could be adjusted by the scale.
-                like = like * masking.resize_as(like, )
-                mse = mse * masking.resize_as(mse, )
+                # The mask is (batch, seq*window, 1), one scalar per frame. Broadcast
+                # it over whatever trailing dims the head produced -- `like`/`mse` are
+                # (batch, seq) for vector heads but keep spatial dims for CNN heads,
+                # so resize_as (which reinterprets the buffer and demands an equal
+                # element count) fails on images and is not what is meant here.
+                like = like * _broadcast_mask(masking, like)
+                mse = mse * _broadcast_mask(masking, mse)
             loss = -torch.mean(like) * self._scales.get(name, 1.0)
             losses[name] = loss
             mses[name] = torch.mean(mse)
