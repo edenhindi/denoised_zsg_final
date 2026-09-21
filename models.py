@@ -132,9 +132,22 @@ class WorldModel(nn.Module):
         # where a per-episode-constant distractor would otherwise sit.
         self._reward_head_action = config.reward_head_action
         self._reward_head_input = config.reward_head_input
+        # Task embedding for the reward head. Its own table, not xi's, so the two
+        # interventions stay separable. Last row is the -1 unlabelled id.
+        self._reward_head_task = config.reward_head_task
+        self._reward_task_dim = int(config.reward_head_task_dim) if self._reward_head_task else 0
+        self._reward_num_tasks = config.task_train_size
+        if self._reward_head_task:
+            self.reward_task_emb = nn.Embedding(
+                self._reward_num_tasks + 1, self._reward_task_dim
+            )
+            self.reward_task_emb.apply(tools.weight_init)
+            self.reward_task_emb.to(config.device)
         reward_feat = {"feat": feat_size, "stoch": stoch_size,
                        "deter": config.dyn_deter}[self._reward_head_input]
-        reward_in = reward_feat + (config.num_actions if self._reward_head_action else 0)
+        reward_in = (reward_feat
+                     + (config.num_actions if self._reward_head_action else 0)
+                     + self._reward_task_dim)
         self.heads["reward"] = networks.MLP(
             reward_in,  # pytorch version
             reward_mlp_shape,
@@ -504,6 +517,9 @@ class WorldModel(nn.Module):
         time_metrics[name] = t
 
     def get_uncertainty_measure(self, features):
+        # Currently unreferenced. If revived under reward_head_task, `features` must
+        # come from reward_head_input(feat, action, task_id) -- the head is wider than
+        # reward_feat alone and calling it with a bare feature will fail on the shape.
         reward_dist = self.heads["reward"](features)
         reward_logits = reward_dist.logits
         logits_pairs_mean = (reward_logits[:, :, 1:] + reward_logits[:, :, :-1]) / 2
@@ -540,6 +556,13 @@ class WorldModel(nn.Module):
             if sequence_indices is not None:
                 idx = np.arange(reward_action.shape[0])[:, np.newaxis]
                 reward_action = reward_action[idx, sequence_indices]
+        # Likewise: the task id must stay aligned with the feature it labels.
+        reward_task = None
+        if self._reward_head_task:
+            reward_task = data.get("task_id")
+            if reward_task is not None and sequence_indices is not None:
+                idx = np.arange(reward_task.shape[0])[:, np.newaxis]
+                reward_task = reward_task[idx, sequence_indices]
 
         self._add_wm_timing(time_metrics, 'sample_features', time.time() - sample_features_time)
 
@@ -575,10 +598,8 @@ class WorldModel(nn.Module):
             elif curr_xi is not None:
                 pred = head(curr_feat, curr_xi, split=self._obs_diff_split)
             elif name == "reward":
-                rf = self.reward_feat(curr_feat)
-                if reward_action is not None:
-                    rf = torch.cat([rf, reward_action], -1)
-                pred = head(rf)
+                pred = head(self.reward_head_input(
+                    curr_feat, reward_action, reward_task))
             else:
                 pred = head(curr_feat)
 
@@ -640,6 +661,40 @@ class WorldModel(nn.Module):
         if self._reward_head_input == "deter":
             return feat[..., self._stoch_size:]
         return feat
+
+    def reward_task_feat(self, task_id, ref):
+        """Embedding for task_id, broadcast to ref's leading dims.
+
+        Mirrors XiRSSM._ctx_feat: out-of-range and missing ids map to the last row.
+        Returns None when the head is not task-conditioned, so callers concatenate
+        nothing. `ref` supplies shape and device only.
+        """
+        if not self._reward_head_task:
+            return None
+        n = self._reward_num_tasks
+        if task_id is None:
+            idx = torch.full(ref.shape[:-1], n, dtype=torch.long, device=ref.device)
+        else:
+            # Dreamer._train reads task_id off the raw batch, which preprocess has not
+            # touched yet, so it can still be a numpy array here; the supervised path
+            # passes a tensor. torch.as_tensor handles both without a copy.
+            idx = torch.as_tensor(task_id, dtype=torch.long, device=ref.device)
+            idx = torch.where((idx >= 0) & (idx < n), idx, torch.full_like(idx, n))
+            # Imagination flattens (batch, time) into one axis and then prepends the
+            # horizon, so the id arrives with fewer dims than ref; broadcast it.
+            while idx.dim() < len(ref.shape) - 1:
+                idx = idx.unsqueeze(0).expand(ref.shape[:idx.dim() + 1])
+        return self.reward_task_emb(idx)
+
+    def reward_head_input(self, feat, action=None, task_id=None):
+        """Assemble the reward head's input: cat([reward_feat, action?, e(task)?])."""
+        parts = [self.reward_feat(feat)]
+        if action is not None:
+            parts.append(action)
+        ctx = self.reward_task_feat(task_id, parts[0])
+        if ctx is not None:
+            parts.append(ctx)
+        return torch.cat(parts, -1) if len(parts) > 1 else parts[0]
 
     def preprocess(self, obs):
         obs = obs.copy()
@@ -808,6 +863,7 @@ class ImagBehavior(nn.Module):
             self,
             start,
             objective=None,
+            task_id=None,
     ):
         objective = objective or self._reward
         self._update_slow_target()
@@ -818,7 +874,11 @@ class ImagBehavior(nn.Module):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
-                reward = objective(imag_feat, imag_state, imag_action)
+                # The task is constant within an episode, so the id that labelled each
+                # start state labels its whole imagined rollout. Flattened like start;
+                # reward_task_feat broadcasts it over the horizon axis.
+                imag_task = None if task_id is None else task_id.reshape(-1)
+                reward = objective(imag_feat, imag_state, imag_action, imag_task)
 
                 # this target is not scaled
                 target, weights, base, actor_ent, state_ent = self._compute_target(

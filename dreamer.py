@@ -72,12 +72,14 @@ class Dreamer(nn.Module):
         self._wm = models.WorldModel(obs_space, act_space, self._logger.get_agent_frames(), config)
         if config.compile and os.name != "nt":  # compilation is not supported on windows
             self._wm = torch.compile(self._wm)
+        # t is the task id, present only under reward_head_task; the head is
+        # r = f(feat, a?, e(task)?) and reward_head_input assembles whichever apply.
         if config.reward_head_action:
-            reward_prediction = lambda f, s, a: self._wm.heads["reward"](
-                torch.cat([self._wm.reward_feat(f), a], -1)).mode()
+            reward_prediction = lambda f, s, a, t=None: self._wm.heads["reward"](
+                self._wm.reward_head_input(f, a, t)).mode()
         else:
-            reward_prediction = lambda f, s, a: self._wm.heads["reward"](
-                self._wm.reward_feat(f)).mode()
+            reward_prediction = lambda f, s, a, t=None: self._wm.heads["reward"](
+                self._wm.reward_head_input(f, None, t)).mode()
         self._task_behavior = models.ImagBehavior(
             config, logger, self._wm, config.behavior_stop_grad, reward_prediction)
         if config.compile and os.name != "nt":  # compilation is not supported on windows
@@ -209,6 +211,10 @@ class Dreamer(nn.Module):
         start = post
         # start['deter'] (16, 64, 512)
 
+        # Labels each start state with its task, for the task-conditioned reward head.
+        # Subsampled below alongside start, or the two desynchronize.
+        behavior_task_id = data.get("task_id") if self._config.reward_head_task else None
+
         batch_indices = None
         if self._config.behavior_batch_length != -1:
             # randomly subsample a minibatch to train the behavior
@@ -222,6 +228,8 @@ class Dreamer(nn.Module):
             ) for _ in range(batch_size)]).reshape(batch_size, self._config.behavior_batch_length)
             batch_indices = np.arange(batch_size)[:, np.newaxis]
             start = {k: v[batch_indices, idx] for k, v in start.items()}
+            if behavior_task_id is not None:
+                behavior_task_id = behavior_task_id[batch_indices, idx]
             metrics["subsample_batch_for_policy_time"] = time.time() - subsample_batch_for_policy_time
 
         # Freeze the policy while collection is random: otherwise it spends the whole
@@ -229,7 +237,8 @@ class Dreamer(nn.Module):
         # and takes over already converged.
         if self._logger.get_agent_frames() >= self._config.random_until:
             task_policy_train_time = time.time()
-            metrics.update(self._task_behavior._train(start)[-1])
+            metrics.update(
+                self._task_behavior._train(start, task_id=behavior_task_id)[-1])
             metrics["task_policy_train_time"] = time.time() - task_policy_train_time
 
         if self._config.expl_behavior != "greedy" and self._config.expl_behavior != "epsilon_greedy":

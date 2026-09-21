@@ -209,6 +209,19 @@ defaults:
   # Which slice of get_feat the reward head reads: 'feat', 'stoch', 'deter'.
   # 'stoch' + reward_head_action matches online-zsg's f(x_flat, action).
   reward_head_input: 'feat'
+  # Feed a learned task embedding to the reward head, so it is r = f(feat, a, e(task)).
+  # Reward here is a function of (task, action) alone, so fitting it otherwise forces
+  # feat to encode the task -- and the cheapest route to the task is the distractor.
+  # Handing the head the task directly removes that pressure from the representation.
+  # Safe because the head is never called at eval: the three call sites are the
+  # imagination objective (dreamer.py), the disagreement bonus (exploration.py), and
+  # the supervised fit, all on train data with labelled ids. The actor reads feat only.
+  # Needs labelled task_ids; the embedding is sized task_train_size + 1 like the xi one,
+  # with the last row for the -1 unlabelled id. Owned by the WorldModel, separate from
+  # the xi table, so this stays independent of xi_ctx_cond.
+  reward_head_task: False
+  # Width of that embedding. Mirrors xi_ctx_dim but is its own knob.
+  reward_head_task_dim: 16
   dyn_scale: '0.5'
   rep_scale: '0.1'
   kl_free: '1.0'

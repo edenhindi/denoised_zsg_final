@@ -18,6 +18,8 @@ parameters:
     values: [0.5]
   seed:
     values: [0, 1, 2, 3, 4]
+  reward_head_task:
+    values: [False, True]
   wandb_group:
     value: xi_cls_cond_100k_sweep_batch_size_branch_decorr_scale
 

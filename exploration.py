@@ -115,7 +115,7 @@ class Plan2Explore(nn.Module):
             metrics.update(self._behavior._train(start, self._intrinsic_reward)[-1])
         return None, metrics
 
-    def _intrinsic_reward(self, feat, state, action):
+    def _intrinsic_reward(self, feat, state, action, task_id=None):
         inputs = feat
         if self._config.disag_action_cond:
             inputs = torch.concat([inputs, action], -1)
@@ -127,7 +127,8 @@ class Plan2Explore(nn.Module):
             disag = torch.log(disag)
         reward = self._config.expl_intr_scale * disag
         if self._config.expl_extr_scale:
-            reward += self._config.expl_extr_scale * self._reward(feat, state, action)
+            reward += self._config.expl_extr_scale * self._reward(
+                feat, state, action, task_id)
         return reward
 
     def _train_ensemble(self, inputs, targets):
