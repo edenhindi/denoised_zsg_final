@@ -410,6 +410,12 @@ def _json_default(o):
 
 
 def main(config):
+    # Distribution argument validation is a debug feature that re-checks logits on
+    # every construction. The RSSM builds one distribution per timestep, so at
+    # batch_length 50 it dominates the scan: profiling put Distribution.__init__ at
+    # 43% of obs_step while the linear/layer_norm math was 2%. Off is 1.5x faster
+    # and changes no numerics -- it only stops raising on malformed parameters.
+    torch.distributions.Distribution.set_default_validate_args(False)
     curr_log_file = pathlib.Path(
         datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S") + "_" + hashlib.sha256(str(config).encode()).hexdigest())
     logdir = pathlib.Path(config.logdir).expanduser()
