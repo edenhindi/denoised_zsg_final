@@ -86,20 +86,32 @@ class Layout:
 
 
 class EmptyRoom(Layout):
-    """Empty room. Goals at the two opposite inner corners."""
+    """Empty room. One goal in each of the four inner corners.
+
+    Four rather than two: with two, guessing a corner is right half the time, and
+    because the reward is step-discounted the "always walk to one corner" policy is
+    a strong local optimum -- it scores ~0.44 against ~0.78 for actually searching,
+    a gap small enough that the agent settles for committing to one goal. Four
+    corners drop a guess to 1/4 and make that shortcut clearly worse, without
+    making the task unsolvable: every corner is still reachable by exploration.
+    """
 
     default_grid_size = 8
 
     @property
     def goal_positions(self):
         s = self.grid_size
-        return [(1, 1), (s - 2, s - 2)]
+        return [(1, 1), (1, s - 2), (s - 2, 1), (s - 2, s - 2)]
 
     def build_walls(self, grid, width, height, rng):
         pass  # only the outer wall, drawn by the caller
 
     def start_pos(self):
-        return ((self.grid_size - 2, 1), (1, 1))  # bottom-left inner corner
+        # Only consulted under fixed_start. Every corner now holds a goal, so the
+        # old bottom-left start would sit on one; start in the middle instead,
+        # which is also equidistant from all four rather than favouring one.
+        c = self.grid_size // 2
+        return ((c, c), (1, 1))
 
 
 class FourRooms(Layout):
@@ -328,7 +340,7 @@ class MiniGridConfound(gym.Env):
             return np.where(seen[..., None], tinted, image)
         return tinted
 
-    def _obs(self, is_first=False):
+    def _obs(self, is_first=False, is_terminal=False):
         image = self._env.render()
         if image.shape[:2] != self._size:
             image = _resize(image, self._size)
@@ -336,13 +348,17 @@ class MiniGridConfound(gym.Env):
         if self._prev_action_idx >= 0:
             one_hot[self._prev_action_idx] = 1.0
         state = np.concatenate([one_hot, [self._prev_reward]], dtype=np.float32)
-        # Episodes end on the step budget, never on failure, so is_terminal stays
-        # False: models.py turns it into the `cont` signal, and marking a time-limit
-        # truncation terminal would tell the world model that value stops there.
+        # is_terminal is True only for reaching the goal, never for the step budget
+        # running out. models.py turns it into `cont` (1 - is_terminal), which is the
+        # imagination discount: marking a time-limit truncation terminal would tell
+        # the world model value stops there, while leaving goal contact non-terminal
+        # tells it value *continues past the goal* -- and since the episode really
+        # does end there, imagined rollouts then collect the goal reward several
+        # times over.
         return {
             "image": self._tint(image),
             "state": state,
-            "is_terminal": False,
+            "is_terminal": is_terminal,
             "is_first": is_first,
         }
 
@@ -368,10 +384,13 @@ class MiniGridConfound(gym.Env):
         self._t += 1
         self._prev_action_idx = action_idx
         self._prev_reward = float(reward)
-        # Reaching the goal ends the meta-episode; the step budget ends it too.
-        # Either way `is_terminal` stays False -- see _obs.
-        done = bool(terminated) or self._t >= self.num_steps
-        return self._obs(), np.float32(reward), done, {"task_id": self.get_task()}
+        # Two different endings: `terminated` is goal contact, which is a real
+        # terminal state (the episode is over and no further value is available),
+        # while the step budget running out is a truncation and must not be.
+        terminated = bool(terminated)
+        done = terminated or self._t >= self.num_steps
+        return (self._obs(is_terminal=terminated), np.float32(reward), done,
+                {"task_id": self.get_task()})
 
     def close(self):
         self._env.close()

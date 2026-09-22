@@ -12,16 +12,18 @@ metric:
   goal: maximize
 
 parameters:
-  batch_size:
-    values: [16]
-  branch_decorr_scale:
-    values: [0.5]
   seed:
     values: [0, 1, 2, 3, 4]
-  reward_head_task:
-    values: [False, True]
-  wandb_group:
-    value: xi_cls_cond_100k_sweep_batch_size_branch_decorr_scale
+  # reward_head_task:
+  #   values: [False, True]
+  # xi_ctx_cond:
+  #   values: [False, True]
+  xi_ctx_scale:
+    values: [0.0, 0.5, 1.0]
+  # branch_decorr_scale:
+  #   values: [0.0, 0.5, 1.0]
+  
+  
 
 # dreamer.py takes "--flag value", so this needs ${args}, not
 # ${args_no_hyphens}, and --configs must come before it.
@@ -41,7 +43,7 @@ command:
   - --random_until
   - "16000"
   - --exp_label
-  - xi_cls_cond_100k_decor_reward_head_task
+  - bandits_ablation
   - --kl_free
   - "0.5"
   - ${args}

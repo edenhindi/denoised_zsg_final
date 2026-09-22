@@ -501,11 +501,14 @@ minigrid_confound:
   meta_learning: True
   task_split: True
   test_repeats: 10
+  task_train_size: 12
+  task_val_size: 12
+  task_test_size: 20
   # 2 goal positions x 20 tasks per split = 10 tasks per goal in every split, so
   # a task-id probe that knows only the goal caps at 1/10 = 0.1. Anything above
   # that is non-behavioural information, i.e. the tint.
   minigrid_layout: 'empty'
-  minigrid_size: 8
+  minigrid_size: 9
   distractor_strength: 0.3
   # The goal never renders, so it can only be found by walking onto it.
   hide_goal: True
@@ -536,7 +539,7 @@ denoised:
   use_exo: True
   xi_ctx_cond: True
   xi_ctx_scale: 1.0
-  branch_decorr_scale: 1.0
+  branch_decorr_scale: 0.5
   reward_head_action: True
   reward_head_task: True
 
