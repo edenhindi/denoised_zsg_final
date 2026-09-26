@@ -105,6 +105,8 @@ defaults:
   xi_ctx_scale: 0.0
   # What the exogenous decoder branch reads: 'deter' or 'feat' (deter + stoch).
   xi_head_input: 'feat'
+  # Vector keys xi's encoder and decoder branch use; '' inherits encoder/decoder mlp_keys.
+  xi_mlp_keys: ''
   # Penalize Cov(endo_mean, exo_mean) per dimension. The decoder scores only their
   # sum, so the split is unidentifiable and drifts into large opposite-signed
   # predictions that cancel. Assumes the additive decoder; says nothing about
@@ -298,6 +300,8 @@ defaults:
   actor_entropy: '3e-4'
   actor_state_entropy: 0.0
   actor_init_std: 1.0
+  # Scale of the actor's output-layer init; small starts near-uniform.
+  actor_outscale: 1.0
   actor_min_std: 0.1
   actor_max_std: 1.0
   actor_temp: 0.1
@@ -533,6 +537,11 @@ minigrid_confound:
   cont_layers: 1
   actor_layers: 3
   value_layers: 3
+  actor_outscale: 0.01
+  # Decode every step, so the single goal step is always in the loss.
+  hidden_states_subsample: -1
+  # xi reads the image only, as in r2dreamer; the `state` vector holds prev action/reward.
+  xi_mlp_keys: '$^'
   # r2dreamer's time_limit. batch_length is derived as num_meta_episodes *
   # max_episode_length = 100 under mamba_context, so it must stay >= initial_wm_horizon.
   max_episode_length: 100

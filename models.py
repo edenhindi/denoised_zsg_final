@@ -55,8 +55,9 @@ class WorldModel(nn.Module):
         # only the endogenous stream may integrate reward feedback.
         self.xi_encoder = None
         if config.use_exo:
+            xi_keys = {"mlp_keys": config.xi_mlp_keys} if config.xi_mlp_keys else {}
             self.xi_encoder = networks.MultiEncoder(
-                shapes, **{**config.encoder, "input_reward": False}
+                shapes, **{**config.encoder, "input_reward": False, **xi_keys}
             )
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
@@ -128,7 +129,8 @@ class WorldModel(nn.Module):
             )
 
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder, xi_feat_size=xi_feat_size
+            feat_size, shapes, **config.decoder, xi_feat_size=xi_feat_size,
+            xi_mlp_keys=config.xi_mlp_keys,
         )
         if config.reconstruction_window > 0:
             self.heads["multi_decoder"] = networks.MultiDecoder(
@@ -136,6 +138,7 @@ class WorldModel(nn.Module):
                 shapes,
                 **config.decoder,
                 xi_feat_size=xi_feat_size,
+                xi_mlp_keys=config.xi_mlp_keys,
             )
         reward_mlp_shape = (255,) if config.reward_head == "symlog_disc" else []
         # With reward_head_action the head is r = f(feat, a) rather than f(feat), so it
@@ -609,14 +612,16 @@ class WorldModel(nn.Module):
             if xi_feat is not None and is_decoder:
                 curr_xi = xi_feat if grad_head else xi_feat.detach()
             if "multi" in name:
-                feat_repeat = curr_feat.repeat(1, self._config.reconstruction_window, 1)
+                # windowed_embed is laid out per timestep, so repeat each step in place.
+                w = self._config.reconstruction_window
+                feat_repeat = curr_feat.repeat_interleave(w, dim=1)
                 feat_and_embed_input = torch.cat([feat_repeat, windowed_embed], dim=-1)
                 if curr_xi is not None:
                     # Repeat xi the same way, so each repeated feature keeps its own
                     # exogenous state.
                     pred = head(
                         feat_and_embed_input,
-                        curr_xi.repeat(1, self._config.reconstruction_window, 1),
+                        curr_xi.repeat_interleave(w, dim=1),
                         split=self._obs_diff_split,
                     )
                 else:
@@ -856,7 +861,7 @@ class ImagBehavior(nn.Module):
             config.actor_min_std,
             config.actor_max_std,
             config.actor_temp,
-            outscale=1.0,
+            outscale=config.actor_outscale,
             unimix_ratio=config.action_unimix_ratio,
         )
         value_mlp_shape = (255,) if config.value_head == "symlog_disc" else []

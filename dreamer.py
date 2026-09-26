@@ -76,8 +76,11 @@ class Dreamer(nn.Module):
         # t is the task id, present only under reward_head_task; the head is
         # r = f(feat, a?, e(task)?) and reward_head_input assembles whichever apply.
         if config.reward_head_action:
+            # The head is trained on the action that led into each state; imagination
+            # passes the one sampled from it, so shift by one step (time-major).
+            prev = lambda a: torch.cat([torch.zeros_like(a[:1]), a[:-1]], 0)
             reward_prediction = lambda f, s, a, t=None: self._wm.heads["reward"](
-                self._wm.reward_head_input(f, a, t)).mode()
+                self._wm.reward_head_input(f, prev(a), t)).mode()
         else:
             reward_prediction = lambda f, s, a, t=None: self._wm.heads["reward"](
                 self._wm.reward_head_input(f, None, t)).mode()
@@ -541,7 +544,8 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
-            is_eval=True,
+            # Not an eval: an eval run trims its cache to one episode at the end.
+            is_eval=False,
             limit=config.dataset_size,
             state2image=state2img,
             num_meta_episodes=config.num_meta_episodes,

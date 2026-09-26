@@ -1023,6 +1023,7 @@ class MultiDecoder(nn.Module):
             input_reward,
             xi_feat_size=0,
             cnn_upsample="transpose",
+            xi_mlp_keys="",
     ):
         super(MultiDecoder, self).__init__()
         if input_reward is True:
@@ -1048,7 +1049,8 @@ class MultiDecoder(nn.Module):
         self._use_xi = xi_feat_size > 0
         self._xi_excluded = ("reward", "time_step")
         self.xi_mlp_shapes = {
-            k: v for k, v in self.mlp_shapes.items() if k not in self._xi_excluded
+            k: v for k, v in self.mlp_shapes.items()
+            if k not in self._xi_excluded and (not xi_mlp_keys or re.match(xi_mlp_keys, k))
         }
         if self._use_xi:
             print("Decoder exogenous CNN shapes:", self.cnn_shapes)
