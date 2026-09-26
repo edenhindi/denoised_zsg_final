@@ -184,8 +184,21 @@ class WorldModel(nn.Module):
                 device=config.device,
             )
 
+        # Task embedding for the continue head, mirroring the reward head's. Termination
+        # here is goal contact, which depends on the task's hidden goal; a task-blind
+        # head can only predict "continue" at every candidate goal, while a
+        # task-conditioned reward head pays there confidently -- so imagination pays
+        # and then keeps going. Own table, so the two stay separable.
+        self._cont_head_task = config.cont_head_task
+        self._cont_task_dim = int(config.cont_head_task_dim) if self._cont_head_task else 0
+        if self._cont_head_task:
+            self.cont_task_emb = nn.Embedding(
+                self._reward_num_tasks + 1, self._cont_task_dim
+            )
+            self.cont_task_emb.apply(tools.weight_init)
+            self.cont_task_emb.to(config.device)
         self.heads["cont"] = networks.MLP(
-            feat_size,  # pytorch version
+            feat_size + self._cont_task_dim,  # pytorch version
             [],
             config.cont_layers,
             config.units,
@@ -569,8 +582,9 @@ class WorldModel(nn.Module):
                 idx = np.arange(reward_action.shape[0])[:, np.newaxis]
                 reward_action = reward_action[idx, sequence_indices]
         # Likewise: the task id must stay aligned with the feature it labels.
+        # Shared by the reward and continue heads, whichever are task-conditioned.
         reward_task = None
-        if self._reward_head_task:
+        if self._reward_head_task or self._cont_head_task:
             reward_task = data.get("task_id")
             if reward_task is not None and sequence_indices is not None:
                 idx = np.arange(reward_task.shape[0])[:, np.newaxis]
@@ -612,6 +626,8 @@ class WorldModel(nn.Module):
             elif name == "reward":
                 pred = head(self.reward_head_input(
                     curr_feat, reward_action, reward_task))
+            elif name == "cont":
+                pred = head(self.cont_head_input(curr_feat, reward_task))
             else:
                 pred = head(curr_feat)
 
@@ -688,6 +704,16 @@ class WorldModel(nn.Module):
         """
         if not self._reward_head_task:
             return None
+        return self._task_feat(self.reward_task_emb, task_id, ref)
+
+    def cont_head_input(self, feat, task_id=None):
+        """The continue head's input: cat([feat, e(task)?]), as reward_head_input."""
+        if not self._cont_head_task:
+            return feat
+        return torch.cat([feat, self._task_feat(self.cont_task_emb, task_id, feat)], -1)
+
+    def _task_feat(self, emb, task_id, ref):
+        """Look task_id up in `emb`, broadcast to ref's leading dims."""
         n = self._reward_num_tasks
         if task_id is None:
             idx = torch.full(ref.shape[:-1], n, dtype=torch.long, device=ref.device)
@@ -701,7 +727,7 @@ class WorldModel(nn.Module):
             # horizon, so the id arrives with fewer dims than ref; broadcast it.
             while idx.dim() < len(ref.shape) - 1:
                 idx = idx.unsqueeze(0).expand(ref.shape[:idx.dim() + 1])
-        return self.reward_task_emb(idx)
+        return emb(idx)
 
     def reward_head_input(self, feat, action=None, task_id=None):
         """Assemble the reward head's input: cat([reward_feat, action?, e(task)?])."""
@@ -899,7 +925,7 @@ class ImagBehavior(nn.Module):
 
                 # this target is not scaled
                 target, weights, base, actor_ent, state_ent = self._compute_target(
-                    imag_feat, imag_state, imag_action, reward,
+                    imag_feat, imag_state, imag_action, reward, imag_task,
                 )
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
@@ -976,10 +1002,12 @@ class ImagBehavior(nn.Module):
         return feats, states, actions
 
     def _compute_target(
-            self, imag_feat, imag_state, imag_action, reward
+            self, imag_feat, imag_state, imag_action, reward, task_id=None
     ):
         if "cont" in self._world_model.heads:
-            discount = self._config.discount * self._world_model.heads["cont"](imag_feat).mean
+            wm = self._world_model
+            discount = self._config.discount * wm.heads["cont"](
+                wm.cont_head_input(imag_feat, task_id)).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
         actor_ent = None

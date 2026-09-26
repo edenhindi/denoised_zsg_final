@@ -1022,6 +1022,7 @@ class MultiDecoder(nn.Module):
         vector_dist,
             input_reward,
             xi_feat_size=0,
+            cnn_upsample="transpose",
     ):
         super(MultiDecoder, self).__init__()
         if input_reward is True:
@@ -1056,6 +1057,10 @@ class MultiDecoder(nn.Module):
         if self.cnn_shapes:
             some_shape = list(self.cnn_shapes.values())[0]
             shape = (sum(x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
+            # Both branches emit raw logits; forward_parts applies cnn_sigmoid once,
+            # to their sum, as r2dreamer does -- sigmoid(endo + exo), not
+            # sigmoid(endo) + sigmoid(exo), which would span [0, 2].
+            self._cnn_sigmoid = cnn_sigmoid
             self._cnn = ConvDecoder(
                 feat_size,
                 shape,
@@ -1064,7 +1069,8 @@ class MultiDecoder(nn.Module):
                 norm,
                 kernel_size,
                 minres,
-                cnn_sigmoid=cnn_sigmoid,
+                cnn_sigmoid=False,
+                upsample=cnn_upsample,
             )
             if self._use_xi:
                 # Same output shape as the endogenous branch, so the two means add.
@@ -1076,7 +1082,8 @@ class MultiDecoder(nn.Module):
                     norm,
                     kernel_size,
                     minres,
-                    cnn_sigmoid=cnn_sigmoid,
+                    cnn_sigmoid=False,
+                    upsample=cnn_upsample,
                 )
         if self.mlp_shapes:
             self._mlp = MLP(
@@ -1135,6 +1142,12 @@ class MultiDecoder(nn.Module):
             split_sizes = [v[-1] for v in self.cnn_shapes.values()]
 
             def _split_image(x):
+                # With cnn_sigmoid, x is a logit: squash into [0, 1], then shift to
+                # the [-0.5, 0.5] space preprocess puts images in. The branches are
+                # summed *before* this, so combined is sigmoid(endo + exo) and each
+                # branch alone renders as sigmoid(branch), like r2dreamer's video.
+                if self._cnn_sigmoid:
+                    x = torch.sigmoid(x) - 0.5
                 return {
                     key: self._make_image_dist(out)
                     for key, out in zip(
@@ -1270,8 +1283,11 @@ class ConvDecoder(nn.Module):
         minres=4,
         outscale=1.0,
         cnn_sigmoid=False,
+        upsample="transpose",
     ):
         super(ConvDecoder, self).__init__()
+        if upsample not in ("transpose", "nearest"):
+            raise ValueError(f"upsample must be 'transpose' or 'nearest', got {upsample!r}")
         act = getattr(torch.nn, act)
         norm = getattr(torch.nn, norm)
         self._shape = shape
@@ -1299,19 +1315,30 @@ class ConvDecoder(nn.Module):
 
             if i != 0:
                 in_dim = 2 ** (layer_num - (i - 1) - 2) * depth
-            pad_h, outpad_h = self.calc_same_pad(k=kernel_size, s=2, d=1)
-            pad_w, outpad_w = self.calc_same_pad(k=kernel_size, s=2, d=1)
-            layers.append(
-                nn.ConvTranspose2d(
-                    in_dim,
-                    out_dim,
-                    kernel_size,
-                    2,
-                    padding=(pad_h, pad_w),
-                    output_padding=(outpad_h, outpad_w),
-                    bias=bias,
+            if upsample == "nearest":
+                # r2dreamer's decoder: nearest upsample, then a stride-1 conv. A
+                # stride-2 transposed conv overlaps its kernel unevenly and paints a
+                # checkerboard from initialisation; with an additive exo branch the
+                # two branches' checkerboards co-adapt to cancel in the sum, so each
+                # branch alone renders as noise.
+                layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
+                layers.append(
+                    nn.Conv2d(in_dim, out_dim, kernel_size, 1, padding="same", bias=bias)
                 )
-            )
+            else:
+                pad_h, outpad_h = self.calc_same_pad(k=kernel_size, s=2, d=1)
+                pad_w, outpad_w = self.calc_same_pad(k=kernel_size, s=2, d=1)
+                layers.append(
+                    nn.ConvTranspose2d(
+                        in_dim,
+                        out_dim,
+                        kernel_size,
+                        2,
+                        padding=(pad_h, pad_w),
+                        output_padding=(outpad_h, outpad_w),
+                        bias=bias,
+                    )
+                )
             if norm:
                 layers.append(ChLayerNorm(out_dim))
             if act:

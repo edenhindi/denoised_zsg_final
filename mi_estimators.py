@@ -87,7 +87,11 @@ class MINE(nn.Module):
 
         I(X; Y) >= E_p(x,y)[T] - log E_p(x)p(y)[e^T]
 
-    with negatives formed by pairing every x with every y in the batch.
+    Negatives come from `negatives`: 'perm' pairs each x with the y of one random
+    permutation of the batch -- n pairs, as r2dreamer does. 'all' pairs every x
+    with every y -- n^2 pairs, a lower-variance estimate, but its activations are
+    held for backward: at n = 16 * 49 that is ~4.5 GiB per term, and it grows 12x
+    as the world-model horizon curriculum runs from 15 to 50.
 
     The DV gradient is biased because log E[e^T] is a minibatch estimate. The
     standard correction divides that term's gradient by an EMA of E[e^T]; it is on
@@ -95,8 +99,12 @@ class MINE(nn.Module):
     """
 
     def __init__(self, x_dim, y_dim, hidden=256, layers=2, act="SiLU",
-                 norm="LayerNorm", ema_decay=0.99, unbiased_grad=True, clip=10.0):
+                 norm="LayerNorm", ema_decay=0.99, unbiased_grad=True, clip=10.0,
+                 negatives="perm"):
         super(MINE, self).__init__()
+        if negatives not in ("perm", "all"):
+            raise ValueError(f"negatives must be 'perm' or 'all', got {negatives!r}")
+        self._negatives = negatives
         self._T = _mlp(x_dim + y_dim, 1, hidden, layers, act, norm)
         self._ema_decay = ema_decay
         self._unbiased_grad = unbiased_grad
@@ -107,12 +115,17 @@ class MINE(nn.Module):
         self.register_buffer("_ema_inited", torch.zeros((), dtype=torch.bool))
 
     def _scores(self, x, y):
-        """T on matched pairs, shape (n,), and on all pairs, shape (n, n)."""
+        """T on matched pairs, shape (n,), and on negatives: (n,) or (n, n)."""
         n = x.shape[0]
         pos = self._T(torch.cat([x, y], -1)).squeeze(-1)
-        x_rep = x.unsqueeze(1).expand(n, n, x.shape[-1])
-        y_rep = y.unsqueeze(0).expand(n, n, y.shape[-1])
-        neg = self._T(torch.cat([x_rep, y_rep], -1)).squeeze(-1)
+        if self._negatives == "perm":
+            # A fixed point pairs an x with its own y; ~1 per batch, negligible.
+            perm = torch.randperm(n, device=y.device)
+            neg = self._T(torch.cat([x, y[perm]], -1)).squeeze(-1)
+        else:
+            x_rep = x.unsqueeze(1).expand(n, n, x.shape[-1])
+            y_rep = y.unsqueeze(0).expand(n, n, y.shape[-1])
+            neg = self._T(torch.cat([x_rep, y_rep], -1)).squeeze(-1)
         return pos.clamp(-self._clip, self._clip), neg.clamp(-self._clip, self._clip)
 
     @torch.no_grad()
@@ -206,23 +219,20 @@ class _Term:
         self.fit = loss.detach()
 
     def metrics(self):
-        """mi/<term>/{bound,loss,fit} plus whatever diagnostics the estimator has."""
+        """mi/<term> is the estimate, mi/fit_<term> the CLUB q's NLL.
+
+        MINE terms log no fit: their fitting loss is the negated bound on the same
+        batch, so it would repeat mi/<term> exactly. The weighted loss is not logged either --
+        it is only sign * scale * the estimate. The
+        estimators' logvar_stats / mi_stats diagnostics are not logged either; each
+        costs extra forward passes per step. Call them by hand when a bound looks
+        wrong.
+        """
         if self.bound is None:
             return {}
-        m = {f"mi/{self.name}/bound": to_np(self.bound)}
-        if self.loss is not None and torch.is_tensor(self.loss):
-            m[f"mi/{self.name}/loss"] = to_np(self.loss)
-        if self.fit is not None:
-            m[f"mi/{self.name}/fit"] = to_np(self.fit)
-        x, y = self.pair
-        # Only the gaussian CLUB has a variance parameter to saturate; the
-        # categorical one has none, which is the point of it.
-        if hasattr(self.estimator, "logvar_stats"):
-            for k, v in self.estimator.logvar_stats(x).items():
-                m[f"mi/{self.name}/{k}"] = to_np(v)
-        if hasattr(self.estimator, "mi_stats"):
-            for k, v in self.estimator.mi_stats(x, y).items():
-                m[f"mi/{self.name}/{k}"] = to_np(v)
+        m = {f"mi/{self.name}": to_np(self.bound)}
+        if self.fit is not None and not isinstance(self.estimator, MINE):
+            m[f"mi/fit_{self.name}"] = to_np(self.fit)
         return m
 
 
@@ -239,7 +249,8 @@ class InfoLosses(nn.Module):
         embed_exo_mi I(embed; xi_stoch)  minimized -- at the encoder bottleneck
 
     G is the discounted return-to-go computed from the rewards actually observed
-    in the buffer, two-hot encoded. Not a critic estimate: a bootstrapped value is
+    in the buffer: a scalar for the MINE term, two-hot for the categorical CLUB
+    one. Not a critic estimate: a bootstrapped value is
     a function of the endogenous stream these terms measure, which would make the
     bounds partly self-referential.
 
@@ -351,19 +362,39 @@ class InfoLosses(nn.Module):
                 config.act, config.norm,
                 ema_decay=self._opt_for("act_endo_mi", "ema_decay"),
                 clip=self._opt_for("act_endo_mi", "clip"),
+                negatives=self._opt_for("act_endo_mi", "negatives"),
             )
             self._act_endo = self._register("act_endo_mi", est, sign=-1, clamp=False)
         else:
             self._act_endo = None
 
         if use_exo and self._opt_for("act_exo_mi", "scale") > 0:
-            est = CLUB(
-                task_code + 2 * xi_feat_size, config.num_actions,
-                self._opt_for("act_exo_mi", "hidden"),
-                self._opt_for("act_exo_mi", "layers"),
-                config.act, config.norm,
-            )
-            self._act_exo = self._register("act_exo_mi", est, sign=1, clamp=True)
+            kind = self._opt_for("act_exo_mi", "est")
+            if kind == "mine":
+                # r2dreamer's choice: a lower bound, minimized. Not a valid penalty
+                # in theory -- driving a lower bound down says nothing about the
+                # true MI -- but it has no variance to pin, unlike the Gaussian
+                # CLUB on a one-hot action. Unclamped, like every lower bound here.
+                est = MINE(
+                    task_code + 2 * xi_feat_size, config.num_actions,
+                    self._opt_for("act_exo_mi", "hidden"),
+                    self._opt_for("act_exo_mi", "layers"),
+                    config.act, config.norm,
+                    ema_decay=self._opt_for("act_exo_mi", "ema_decay"),
+                    clip=self._opt_for("act_exo_mi", "clip"),
+                    negatives=self._opt_for("act_exo_mi", "negatives"),
+                )
+                self._act_exo = self._register("act_exo_mi", est, sign=1, clamp=False)
+            elif kind == "club":
+                est = CLUB(
+                    task_code + 2 * xi_feat_size, config.num_actions,
+                    self._opt_for("act_exo_mi", "hidden"),
+                    self._opt_for("act_exo_mi", "layers"),
+                    config.act, config.norm,
+                )
+                self._act_exo = self._register("act_exo_mi", est, sign=1, clamp=True)
+            else:
+                raise ValueError(f"act_exo_mi_est must be 'mine' or 'club', got {kind!r}")
         else:
             self._act_exo = None
 
@@ -372,31 +403,53 @@ class InfoLosses(nn.Module):
         # DiscDist bucket count rather than num_actions.
         self._rew_bins = config.rew_mi_bins
         if self._opt_for("rew_endo_mi", "scale") > 0:
+            # Scalar return, as r2dreamer passes it: a 255-wide two-hot is a sparse
+            # input on which T has to learn every bucket separately.
             est = MINE(
-                task_code + 2 * feat_size, self._rew_bins,
+                task_code + 2 * feat_size, 1,
                 self._opt_for("rew_endo_mi", "hidden"),
                 self._opt_for("rew_endo_mi", "layers"),
                 config.act, config.norm,
                 ema_decay=self._opt_for("rew_endo_mi", "ema_decay"),
                 clip=self._opt_for("rew_endo_mi", "clip"),
+                negatives=self._opt_for("rew_endo_mi", "negatives"),
             )
             self._rew_endo = self._register("rew_endo_mi", est, sign=-1, clamp=False)
         else:
             self._rew_endo = None
 
         if use_exo and self._opt_for("rew_exo_mi", "scale") > 0:
-            # Categorical, not Gaussian: the two-hot return is a distribution over
-            # buckets, and a diagonal Gaussian on it fails the same two ways run #12
-            # found for one-hot xi -- variance pinned at the floor, and no ability to
-            # discriminate, since distinct two-hot vectors are near-equidistant in
-            # L2. One group of `bins` classes, so chance is ln(bins).
-            est = networks.CategoricalCLUB(
-                task_code + 2 * xi_feat_size, 1, self._rew_bins,
-                self._opt_for("rew_exo_mi", "hidden"),
-                self._opt_for("rew_exo_mi", "layers"),
-                config.act, config.norm,
-            )
-            self._rew_exo = self._register("rew_exo_mi", est, sign=1, clamp=True)
+            kind = self._opt_for("rew_exo_mi", "est")
+            if kind == "mine":
+                # Same choice and caveat as act_exo_mi: a lower bound, minimized,
+                # on the scalar G the rew_endo MINE also takes, so rew_diff
+                # compares like with like.
+                est = MINE(
+                    task_code + 2 * xi_feat_size, 1,
+                    self._opt_for("rew_exo_mi", "hidden"),
+                    self._opt_for("rew_exo_mi", "layers"),
+                    config.act, config.norm,
+                    ema_decay=self._opt_for("rew_exo_mi", "ema_decay"),
+                    clip=self._opt_for("rew_exo_mi", "clip"),
+                    negatives=self._opt_for("rew_exo_mi", "negatives"),
+                )
+                self._rew_exo = self._register("rew_exo_mi", est, sign=1, clamp=False)
+            elif kind == "club":
+                # Categorical, not Gaussian: the two-hot return is a distribution
+                # over buckets, and a diagonal Gaussian on it fails the same two
+                # ways run #12 found for one-hot xi -- variance pinned at the floor,
+                # and no ability to discriminate, since distinct two-hot vectors are
+                # near-equidistant in L2. One group of `bins` classes, so chance is
+                # ln(bins).
+                est = networks.CategoricalCLUB(
+                    task_code + 2 * xi_feat_size, 1, self._rew_bins,
+                    self._opt_for("rew_exo_mi", "hidden"),
+                    self._opt_for("rew_exo_mi", "layers"),
+                    config.act, config.norm,
+                )
+                self._rew_exo = self._register("rew_exo_mi", est, sign=1, clamp=True)
+            else:
+                raise ValueError(f"rew_exo_mi_est must be 'mine' or 'club', got {kind!r}")
         else:
             self._rew_exo = None
 
@@ -488,11 +541,19 @@ class InfoLosses(nn.Module):
         dropped. Steps whose task_id falls outside the train split are dropped too:
         the one-hot has one column per train task, and an unlabelled step (-1)
         would set the wrong column rather than error.
+
+        The target is taken at s', not s: the buffer stores with each observation
+        the action that produced it, so target[:, 1:] is the action (and the
+        reward-to-go starting with the reward) of the s -> s' transition.
+        target[:, :-1] would be the action that produced s instead. Pairs where s'
+        opens a new episode are dropped: s belongs to the previous episode, and the
+        action stored at a reset is the zero fill from add_to_cache.
         """
         n = self._config.task_train_size
         task = data["task_id"].long()
-        # A step is usable if it is labelled *and* its successor exists.
-        valid = ((task >= 0) & (task < n))[:, :-1]
+        # A step is usable if it is labelled, its successor exists, and the
+        # successor is in the same episode.
+        valid = ((task >= 0) & (task < n))[:, :-1] & ~data["is_first"][:, 1:].bool()
         if not torch.any(valid):
             return None
         # Clamp before the one-hot: invalid rows are masked out immediately after,
@@ -501,14 +562,16 @@ class InfoLosses(nn.Module):
             task[:, :-1].clamp(0, n - 1), n
         ).to(stream_feat.dtype)
         x = torch.cat([e, stream_feat[:, :-1], stream_feat[:, 1:]], -1)
-        y = target[:, :-1]
+        y = target[:, 1:]
         # Masking after the concat keeps the pairing intact: flattening first and
         # then selecting would let a dropped row's successor pair with the wrong
         # step. The result is a flat (N, dim) with only usable rows.
         return x[valid], y[valid]
 
     def _return_target(self, data):
-        """Two-hot discounted return-to-go, from the rewards in the buffer.
+        """Discounted return-to-go, from the rewards in the buffer, as (B, T, 1).
+
+        Scalar; `_two_hot` converts it for the categorical exogenous term.
 
         `tools.lambda_return` with lambda_=1 and a zero value function is the
         discounted Monte Carlo return, so no critic enters: a bootstrapped value
@@ -528,10 +591,17 @@ class InfoLosses(nn.Module):
             reward_t, zeros, self._config.discount, None, 1.0, axis=0
         )
         ret = torch.stack(list(ret), dim=0) if isinstance(ret, tuple) else ret
+        return ret.to(reward.dtype)
+
+    def _two_hot(self, ret):
+        """(B, T, 1) scalar return -> (B, T, bins), matching tools.DiscDist."""
+        import tools
+
+        ret = ret.squeeze(-1)
         return tools.DiscDist(
             logits=torch.zeros(*ret.shape[:2], self._rew_bins, device=ret.device),
             device=ret.device,
-        ).two_hot(ret).to(reward.dtype)
+        ).two_hot(ret).to(ret.dtype)
 
     # ------------------------------------------------------------------
     # The three phases
@@ -580,8 +650,9 @@ class InfoLosses(nn.Module):
                 total = total + self._rew_endo.compute(
                     self._pair_inputs(feat, data, ret))
             if self._rew_exo is not None:
-                total = total + self._rew_exo.compute(
-                    self._pair_inputs(xi_feat, data, ret))
+                mine = isinstance(self._rew_exo.estimator, MINE)
+                total = total + self._rew_exo.compute(self._pair_inputs(
+                    xi_feat, data, ret if mine else self._two_hot(ret)))
             self._add_timing(timing, "rew_mi", time.time() - t)
         return total
 
@@ -600,10 +671,9 @@ class InfoLosses(nn.Module):
         metrics = {}
         for term in self._terms:
             metrics.update(term.metrics())
-        # The gap each pair jointly widens. Read it only alongside that pair's two
-        # fit metrics -- it differences a lower bound against an upper bound
-        # estimated by a different net, so it is a direction of travel, not a
-        # calibrated quantity in nats.
+        # The gap each pair jointly widens. Two separately trained nets -- and, with
+        # *_exo_mi_est 'club', a lower bound against an upper one -- so it is a
+        # direction of travel, not a calibrated quantity in nats.
         for name, endo, exo in (("act", self._act_endo, self._act_exo),
                                 ("rew", self._rew_endo, self._rew_exo)):
             if (endo is not None and exo is not None

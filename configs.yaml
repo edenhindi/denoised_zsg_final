@@ -119,14 +119,16 @@ defaults:
 
   # Mutual-information terms, named for the pair each is taken over. All three are
   # off unless use_infolosses is True; a scale of 0 then disables one individually.
-  # Metrics: mi/<term>/{bound,loss,fit} -- read `bound` only alongside `fit`, which
-  # says whether the estimator has converged.
+  # Metrics: mi/<term> is the estimate. mi_fit/<term>, CLUB terms only, is q's
+  # NLL -- compare it to chance (ln classes per group); a CLUB bound means
+  # nothing until q fits. MINE logs no fit: it would be the negated estimate.
+  # mi/{act,rew}_diff is endo minus exo for each pair.
   #
   #   endo_exo_mi  I(z; xi)           CLUB upper bound, minimized. Needs use_exo.
   #   act_endo_mi  I((e, s, s'); a)   MINE lower bound, maximized.
-  #   act_exo_mi   I((e, xi, xi'); a) CLUB upper bound, minimized. Needs use_exo.
+  #   act_exo_mi   I((e, xi, xi'); a) CLUB or MINE (act_exo_mi_est), minimized. Needs use_exo.
   #   rew_endo_mi  I((e, s, s'); G)   MINE lower bound, maximized.
-  #   rew_exo_mi   I((e, xi, xi'); G) CLUB upper bound, minimized. Needs use_exo.
+  #   rew_exo_mi   I((e, xi, xi'); G) CLUB or MINE (rew_exo_mi_est), minimized. Needs use_exo.
   #   embed_exo_mi I(embed; xi_stoch) CLUB upper bound, minimized. Needs use_exo.
   use_infolosses: False
 
@@ -136,6 +138,10 @@ defaults:
   mi_layers: 2
   mi_lr: 3e-4
   mi_inner_steps: 1
+  # MINE negatives: 'perm' pairs each sample with one random permutation of the
+  # batch (n pairs, as r2dreamer). 'all' uses every pair (n^2): ~4.5 GiB per term
+  # at batch 16 x horizon 50, which is what took minigrid runs past 20 GB.
+  mi_negatives: 'perm'
 
   endo_exo_mi_scale: 0.1
   # Which part of each stream the bound is taken over: 'feat' (deter ++ stoch),
@@ -162,6 +168,12 @@ defaults:
   act_endo_mi_clip: 10.0
 
   act_exo_mi_scale: 0.0
+  # 'club' is a valid upper bound but Gaussian on a one-hot action, so its
+  # variance pins at the floor. 'mine' is what r2dreamer does: a lower bound,
+  # minimized -- no guarantee on the true MI, but no misspecified q either.
+  act_exo_mi_est: 'club'
+  act_exo_mi_ema_decay: 0.99
+  act_exo_mi_clip: 10.0
 
   rew_endo_mi_scale: 0.1
   rew_endo_mi_ema_decay: 0.99
@@ -173,7 +185,13 @@ defaults:
   embed_exo_mi_scale: 0.0
 
   rew_exo_mi_scale: 0.1
-  # Bucket count for the two-hot return target, matching tools.DiscDist. G is the
+  # Same choice as act_exo_mi_est. 'club' is a categorical q over the two-hot G
+  # (chance ln(rew_mi_bins)); 'mine' takes the scalar G, like rew_endo_mi.
+  rew_exo_mi_est: 'club'
+  rew_exo_mi_ema_decay: 0.99
+  rew_exo_mi_clip: 10.0
+  # Bucket count for the two-hot return target of rew_exo_mi, matching
+  # tools.DiscDist; rew_endo_mi's MINE takes G as a scalar. G is the
   # discounted return-to-go over the rewards actually in the buffer -- not a critic
   # estimate, which would be a function of the endogenous stream being measured.
   rew_mi_bins: 255
@@ -198,9 +216,9 @@ defaults:
   act: 'SiLU'
   norm: 'LayerNorm'
   encoder:
-    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 2, mlp_units: 512, symlog_inputs: True }
+    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 5, minres: 4, mlp_layers: 2, mlp_units: 512, symlog_inputs: True }
   decoder:
-    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 2, mlp_units: 512, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse }
+    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 5, minres: 4, mlp_layers: 2, mlp_units: 512, cnn_sigmoid: False, cnn_upsample: 'transpose', image_dist: mse, vector_dist: symlog_mse }
   value_head: 'symlog_disc'
   reward_head: 'symlog_disc'
   # Feed the action to the reward head, so it is r = f(feat, a) and cannot fit reward
@@ -222,6 +240,14 @@ defaults:
   reward_head_task: False
   # Width of that embedding. Mirrors xi_ctx_dim but is its own knob.
   reward_head_task_dim: 16
+  # The same for the continue head: cont = f(feat, e(task)). Where termination is
+  # reaching a hidden, task-specific goal (minigrid), a task-blind head predicts
+  # "continue" at every candidate goal while a task-conditioned reward head pays at
+  # the right one -- so imagination collects the reward and keeps going. Same
+  # safety argument as reward_head_task: called only on labelled train data and in
+  # imagination, never by the actor. Own embedding table and width.
+  cont_head_task: False
+  cont_head_task_dim: 16
   dyn_scale: '0.5'
   rep_scale: '0.1'
   kl_free: '1.0'
@@ -485,15 +511,31 @@ minigrid_confound:
   logdir: ./minigrid_confound
   # Pixels in, plus the small `state` vector carrying prev action and reward.
   encoder: { mlp_keys: 'state', cnn_keys: 'image' }
-  decoder: { mlp_keys: 'state', cnn_keys: 'image' }
+  # cnn_sigmoid as in r2dreamer: the image is sigmoid(endo + exo), so the
+  # prediction is bounded to pixel range and each branch displays as an image.
+  # cnn_upsample 'nearest' is r2dreamer's upsample + conv; the default
+  # 'transpose' paints a checkerboard into each branch that cancels in the sum.
+  # kernel_size 5 as r2dreamer's decoder; odd, so padding='same' needs no copy.
+  decoder: { mlp_keys: 'state', cnn_keys: 'image', cnn_sigmoid: True, cnn_upsample: 'nearest', kernel_size: 5 }
   size: [64, 64]
   actor_dist: 'onehot'
   imag_gradient: 'reinforce'
   imag_horizon: 15
   train_ratio: 0.1
-  # batch_length is derived as num_meta_episodes * max_episode_length = 200 under
-  # mamba_context, so it must stay above initial_wm_horizon.
-  max_episode_length: 50
+  # r2dreamer's sizes (deter 512, stoch 32x8, hidden 128), its KL balance (dyn 1.0
+  # against rep 0.1) and its head depths (reward/cont 1 layer, actor/value 3).
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 8
+  dyn_hidden: 128
+  dyn_scale: '1.0'
+  reward_layers: 1
+  cont_layers: 1
+  actor_layers: 3
+  value_layers: 3
+  # r2dreamer's time_limit. batch_length is derived as num_meta_episodes *
+  # max_episode_length = 100 under mamba_context, so it must stay >= initial_wm_horizon.
+  max_episode_length: 100
   # >1, unlike bandits: one navigation episode is the search, the rest are recall.
   # A single episode would leave nothing for the shortcut to short-cut.
   num_meta_episodes: 1
@@ -501,25 +543,33 @@ minigrid_confound:
   meta_learning: True
   task_split: True
   test_repeats: 10
-  task_train_size: 12
-  task_val_size: 12
+  # 20 per split, as r2dreamer. 'empty' has 4 corner goals, so every split holds
+  # exactly 5 tasks per goal and a task-id probe that knows only the goal caps at
+  # 1/5. Anything above that is non-behavioural information, i.e. the tint. (With
+  # 'empty2', 10 per goal: 1/10.) Keep sizes a multiple of the goal count.
+  task_train_size: 20
+  task_val_size: 20
   task_test_size: 20
-  # 2 goal positions x 20 tasks per split = 10 tasks per goal in every split, so
-  # a task-id probe that knows only the goal caps at 1/10 = 0.1. Anything above
-  # that is non-behavioural information, i.e. the tint.
   minigrid_layout: 'empty'
-  minigrid_size: 9
+  # r2dreamer's Empty-8x8: 6x6 inner cells.
+  minigrid_size: 8
   distractor_strength: 0.3
   # The goal never renders, so it can only be found by walking onto it.
   hide_goal: True
   fixed_start: True
+  # Face a random direction each episode, as r2dreamer: a fixed action script can
+  # no longer solve the task. Only consulted under fixed_start.
+  random_start_dir: True
   partial_obs: False
   generator_seed: 0
 
   actor_lr: 3e-05
   model_lr: 1e-4
   value_lr: 3e-05
-  discount: 0.99
+  # r2dreamer's 1 - 1/horizon with horizon 333. At 0.99 a search that arrives at
+  # step ~25 is discounted ~0.78 on top of the reward's own time decay, which
+  # tilts the value further toward walking straight to a memorised corner.
+  discount: 0.997
 
 # Harder binding: the agent sees only its egocentric view, so the tint covers the
 # visible region rather than the whole map. Run as:
@@ -542,6 +592,20 @@ denoised:
   branch_decorr_scale: 0.5
   reward_head_action: True
   reward_head_task: True
+
+info_losses:
+  use_infolosses: True
+  # The *_exo terms are skipped without it, so act_exo_mi would silently be off
+  # unless `denoised` is also passed.
+  use_exo: True
+  endo_exo_mi_scale: 0.0
+  act_endo_mi_scale: 0.1
+  act_exo_mi_scale: 0.1
+  act_exo_mi_est: 'mine'
+  rew_exo_mi_est: 'mine'
+  rew_endo_mi_scale: 0.1
+  rew_exo_mi_scale: 0.1
+  embed_exo_mi_scale: 0.0
 
 debug:
   debug: True

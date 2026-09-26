@@ -114,6 +114,32 @@ class EmptyRoom(Layout):
         return ((c, c), (1, 1))
 
 
+class EmptyRoomTwoGoals(EmptyRoom):
+    """Empty room, two goals: upper-left and bottom-right; start upper-right.
+
+    Both goals are adjacent to the start and equidistant from it, so neither is
+    favoured. On 9x9 with a 50-step budget: memorizing scores 0.86, the best search
+    0.75 (a 21-step tour), and a memorizer on an unfamiliar tint ~0.43. The shortcut
+    still pays on train (+0.12) and still shows on held-out tasks, but a whole search
+    fits inside a 25-step imagination.
+
+    Not upper-left + bottom-left: from the upper-right start the search passes one
+    goal on the way to the other, so memorizing gains ~0.01 and there is no shortcut
+    for a method to remove. With two goals a guess is right half the time -- the
+    reason `EmptyRoom` has four -- so read held-out return with the task probe
+    (ceiling 1 / tasks-per-goal), not alone.
+    """
+
+    @property
+    def goal_positions(self):
+        s = self.grid_size
+        return [(1, 1), (s - 2, s - 2)]  # (row, col): upper-left, bottom-right
+
+    def start_pos(self):
+        # place_agent takes (x, y), unlike goal_positions' (row, col).
+        return ((self.grid_size - 2, 1), (1, 1))  # upper-right inner corner
+
+
 class FourRooms(Layout):
     """Four rooms split by cross walls, one door per wall segment.
 
@@ -156,6 +182,7 @@ class FourRooms(Layout):
 
 LAYOUTS = {
     "empty": EmptyRoom,
+    "empty2": EmptyRoomTwoGoals,
     "fourrooms": FourRooms,
 }
 
@@ -222,12 +249,20 @@ class _MiniGridCore(_MiniGridBase):
     """
 
     def __init__(self, layout, num_steps, agent_view_size=7, hide_goal=True,
-                 fixed_start=True, tile_size=8, partial_obs=False):
+                 fixed_start=True, tile_size=8, partial_obs=False,
+                 random_start_dir=False, start_dir_seed=0):
         self.layout = layout
         self._goal_pos = layout.goal_positions[0]
         self._door_seed = 0
         self._hide_goal = hide_goal
         self._fixed_start = fixed_start
+        # Per-episode facing, as r2dreamer's place_agent draws it: a fixed action
+        # script then cannot solve the task, and the opening states vary. Drawn from
+        # this env's own seeded RNG, not MiniGrid's, so runs are reproducible -- but
+        # it is deliberately outside the task dict, like the per-step randomness of
+        # SparsePointWindEnv: a fixed task no longer pins down the first frame.
+        self._random_start_dir = random_start_dir
+        self._dir_rng = np.random.default_rng(start_dir_seed)
         super().__init__(
             mission_space=MissionSpace(mission_func=lambda: "get to the goal square"),
             grid_size=layout.grid_size,
@@ -259,7 +294,8 @@ class _MiniGridCore(_MiniGridBase):
             # frame of a hidden-goal search would vary run to run. rand_dir=False
             # leaves agent_dir at -1 ("invalid direction"), so set it explicitly.
             self.place_agent(top=top, size=size, rand_dir=False)
-            self.agent_dir = 0  # facing right
+            # Facing right unless random_start_dir; see __init__.
+            self.agent_dir = int(self._dir_rng.integers(4)) if self._random_start_dir else 0
         else:
             self.place_agent()
         self.mission = "get to the goal square"
@@ -270,7 +306,8 @@ class MiniGridConfound(gym.Env):
 
     def __init__(self, layout, num_steps, size=(64, 64), use_distractor=True,
                  distractor_strength=0.3, agent_view_size=7, hide_goal=True,
-                 fixed_start=True, partial_obs=False):
+                 fixed_start=True, partial_obs=False, random_start_dir=False,
+                 start_dir_seed=0):
         super().__init__()
         self.num_steps = num_steps
         self._size = tuple(size)
@@ -290,6 +327,8 @@ class MiniGridConfound(gym.Env):
             fixed_start=fixed_start,
             tile_size=max(1, self._size[0] // layout.grid_size),
             partial_obs=partial_obs,
+            random_start_dir=random_start_dir,
+            start_dir_seed=start_dir_seed,
         )
         self._num_actions = 3  # left, right, forward -- pickup/drop/toggle are no-ops here
 

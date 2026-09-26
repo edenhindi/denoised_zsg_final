@@ -9,6 +9,7 @@ import pickle
 import random
 import sys
 import time
+import zlib
 
 os.environ["GYM_NOTICES_ENABLED"] = "false"  # silence gym's unmaintained-version banner
 import gym
@@ -211,9 +212,11 @@ class Dreamer(nn.Module):
         start = post
         # start['deter'] (16, 64, 512)
 
-        # Labels each start state with its task, for the task-conditioned reward head.
-        # Subsampled below alongside start, or the two desynchronize.
-        behavior_task_id = data.get("task_id") if self._config.reward_head_task else None
+        # Labels each start state with its task, for the task-conditioned reward and
+        # continue heads. Subsampled below alongside start, or the two desynchronize.
+        behavior_task_id = (data.get("task_id")
+                            if self._config.reward_head_task or self._config.cont_head_task
+                            else None)
 
         batch_indices = None
         if self._config.behavior_batch_length != -1:
@@ -291,6 +294,9 @@ def make_env(config, mode, index=0):
             hide_goal=config.hide_goal,
             fixed_start=config.fixed_start,
             partial_obs=config.partial_obs,
+            random_start_dir=config.random_start_dir,
+            # One direction stream per env, distinct across modes and workers.
+            start_dir_seed=[config.seed, zlib.crc32(mode.encode()), index],
         )
         env = wrappers.OneHotAction(env)
     elif suite == "dmc":

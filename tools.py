@@ -70,6 +70,14 @@ class Logger:
         wandb.log({name: wandb.Image(value), "env_step": self.step}, commit=False)
 
     def video(self, name, value):
+        # wandb casts non-uint8 video with a bare astype(uint8), so a float frame
+        # in [0, 1] -- what video_pred returns -- truncates to 0 and logs black.
+        # Floats are always read as [0, 1], as r2dreamer's logger does; a range
+        # test on max() misfires when a decoder branch overshoots. uint8 callers
+        # (policy videos) pass through untouched.
+        value = np.asarray(value)
+        if np.issubdtype(value.dtype, np.floating):
+            value = (np.clip(value, 0.0, 1.0) * 255.0).astype(np.uint8)
         wandb.log({
             name: wandb.Video(value[0].transpose(0, 3, 1, 2), format="mp4"),
             "env_step": self.step,
