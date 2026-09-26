@@ -483,8 +483,8 @@ bandits:
   # the old split put half of val on arm 2 while never exercising arms 0 or 1.
   test_repeats: 10
   prefill: 8
-  num_arms: 5
-  distractor_dim: 8
+  num_arms: 6
+  distractor_dim: 6
   reward_mode: 'binary'
   static_distractor: True
   generator_seed: 0
@@ -496,6 +496,10 @@ bandits:
   discount: 0.99
   
   log_every: 500
+
+  task_train_size: 24
+  task_val_size: 24
+  task_test_size: 24
 # Same as `bandits` but the distractor drifts within the episode, so it is harder
 # to bind to a single optimal arm. Run as: --configs bandits bandits_drift
 bandits_drift:
@@ -543,8 +547,8 @@ minigrid_confound:
   # xi reads the image only, as in r2dreamer; the `state` vector holds prev action/reward.
   xi_mlp_keys: '$^'
   # r2dreamer's time_limit. batch_length is derived as num_meta_episodes *
-  # max_episode_length = 100 under mamba_context, so it must stay >= initial_wm_horizon.
-  max_episode_length: 100
+  # max_episode_length = 256 under mamba_context, so it must stay >= initial_wm_horizon.
+  max_episode_length: 256
   # >1, unlike bandits: one navigation episode is the search, the rest are recall.
   # A single episode would leave nothing for the shortcut to short-cut.
   num_meta_episodes: 1
@@ -600,7 +604,7 @@ denoised:
   xi_ctx_scale: 1.0
   branch_decorr_scale: 0.5
   reward_head_action: True
-  reward_head_task: True
+  # reward_head_task: True
 
 info_losses:
   use_infolosses: True
