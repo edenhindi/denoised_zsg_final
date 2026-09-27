@@ -44,6 +44,10 @@ command:
   - "16000"
   - --reconstruction_window
   - "0"
+  - --expl_amount
+  - "0.1"
+  - --actor_entropy
+  - "1e-3"
   - --exp_label
   - bandits_seeds
   - --kl_free

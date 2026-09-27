@@ -604,7 +604,7 @@ denoised:
   xi_ctx_scale: 1.0
   branch_decorr_scale: 0.5
   reward_head_action: True
-  # reward_head_task: True
+  reward_head_task: True
 
 info_losses:
   use_infolosses: True
