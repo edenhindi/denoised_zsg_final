@@ -449,12 +449,12 @@ bandits:
   meta_learning: True
   task_split: True
   # 20/20/20 over 60 tasks. optimal_arm is index % num_arms, so each split of 20
-  # holds exactly 4 tasks per arm -- a 4-task val set could not cover 5 arms, and
+  # holds exactly 4 tasks per arm -- a 4-task val set could not cover 6 arms, and
   # the old split put half of val on arm 2 while never exercising arms 0 or 1.
   test_repeats: 10
   prefill: 8
-  num_arms: 5
-  distractor_dim: 8
+  num_arms: 6
+  distractor_dim: 6
   reward_mode: 'binary'
   static_distractor: True
   generator_seed: 0
@@ -464,6 +464,11 @@ bandits:
   value_lr: 3e-04
   # actor_entropy: '1e-3'
   discount: 0.99
+  
+
+  task_train_size: 24
+  task_val_size: 24
+  task_test_size: 24
   
   log_every: 500
 # Same as `bandits` but the distractor drifts within the episode, so it is harder
@@ -479,11 +484,11 @@ bandits_drift:
 # Needs labelled task_ids, i.e. task_split: True and train ids 0..task_train_size-1.
 denoised:
   use_exo: True
-  xi_ctx_cond: True
+  xi_ctx_cond: False
   xi_ctx_scale: 1.0
   branch_decorr_scale: 1.0
   reward_head_action: True
-  reward_head_task: True
+  reward_head_task: False
 
 debug:
   debug: True
