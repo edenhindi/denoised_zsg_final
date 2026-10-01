@@ -1024,6 +1024,7 @@ class MultiDecoder(nn.Module):
             xi_feat_size=0,
             cnn_upsample="transpose",
             xi_mlp_keys="",
+            mlp_sigmoid=False,
     ):
         super(MultiDecoder, self).__init__()
         if input_reward is True:
@@ -1087,7 +1088,13 @@ class MultiDecoder(nn.Module):
                     cnn_sigmoid=False,
                     upsample=cnn_upsample,
                 )
+        # With mlp_sigmoid each branch squashes its own output into [0, 1] and the
+        # two are added, so the mean is the prediction itself rather than its
+        # symlog -- symlog_mse would symexp a [0, 1] mean and distort it.
+        self._mlp_sigmoid = mlp_sigmoid
         if self.mlp_shapes:
+            if mlp_sigmoid:
+                vector_dist = "mse"
             self._mlp = MLP(
                 feat_size,
                 self.mlp_shapes,
@@ -1169,6 +1176,23 @@ class MultiDecoder(nn.Module):
         if self.mlp_shapes:
             stats = self._mlp.forward_stats(features)
 
+            def _squash(source):
+                """One sigmoid per reconstruction head, before the branches add.
+
+                Unlike the image path -- sigmoid(endo + exo) -- each branch is
+                squashed on its own, so each is a bounded prediction in [0, 1] in
+                its own right and the sum spans [0, 2]. The branches can no longer
+                cancel through large opposite-signed means, since neither can leave
+                [0, 1]; the cost is that a target of 0 needs *both* branches at 0,
+                so the split is biased low near zero.
+                """
+                if not self._mlp_sigmoid:
+                    return source
+                return {
+                    name: (torch.sigmoid(mean), std)
+                    for name, (mean, std) in source.items()
+                }
+
             def _make_vector(source):
                 return {
                     name: self._mlp.dist(
@@ -1179,6 +1203,8 @@ class MultiDecoder(nn.Module):
 
             if use_xi and self.xi_mlp_shapes:
                 xi_stats = self._mlp_xi.forward_stats(xi_features)
+                # Squash first, then sum: sigmoid(endo) + sigmoid(exo).
+                stats, xi_stats = _squash(stats), _squash(xi_stats)
                 # Every key survives; only those with an exogenous branch are summed.
                 total = {
                     name: (mean + xi_stats[name][0], std)
@@ -1190,7 +1216,7 @@ class MultiDecoder(nn.Module):
                 endo_only.update(_make_vector(stats))
                 exo_only.update(_make_vector(xi_stats))
             else:
-                combined.update(_make_vector(stats))
+                combined.update(_make_vector(_squash(stats)))
 
         if not use_xi:
             return combined, None, None
@@ -1208,7 +1234,11 @@ class MultiDecoder(nn.Module):
             xi_stats = self._mlp_xi.forward_stats(xi_features)
             for name in xi_stats:
                 if name in stats:
-                    out[name] = (stats[name][0], xi_stats[name][0])
+                    endo, exo = stats[name][0], xi_stats[name][0]
+                    if self._mlp_sigmoid:
+                        # Correlate what the loss actually adds, post-squash.
+                        endo, exo = torch.sigmoid(endo), torch.sigmoid(exo)
+                    out[name] = (endo, exo)
         if self.cnn_shapes:
             out["_cnn"] = (self._cnn(features), self._cnn_xi(xi_features))
         return out
@@ -1492,6 +1522,11 @@ class MLP(nn.Module):
             return tools.DiscDist(logits=mean, device=self._device)
         if dist == "symlog_mse":
             return tools.SymlogDist(mean)
+        if dist == "mse":
+            # Plain squared error in data space -- no symlog on the target. Used by
+            # the sigmoid-squashed decoder branches, whose mean is already the
+            # prediction rather than its symlog.
+            return tools.MSEDist(mean)
         raise NotImplementedError(dist)
 
 

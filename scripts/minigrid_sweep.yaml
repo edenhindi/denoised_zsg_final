@@ -1,0 +1,54 @@
+# Ten seeds of the denoised + info_losses config on minigrid empty-layout navigation,
+# to measure run-to-run spread.
+#   wandb sweep scripts/minigrid_sweep.yaml
+#   wandb agent <sweep-id>       # one agent per GPU
+#
+# Seeding is live as of 9c59a70, so a seed value reproduces its run exactly -- these
+# are ten distinct draws, not ten resamples of the same one. Note `seed` does not seed
+# the task set: that comes from task_split_seed / generator_seed, so all ten runs share
+# one task dataset and differ only in init/exploration.
+program: dreamer.py
+method: grid
+project: dreamer-v3
+
+metric:
+  name: eval_return
+  goal: maximize
+
+parameters:
+  seed:
+    values: [0, 1, 2, 3, 4]
+
+# dreamer.py takes "--flag value", so this needs ${args}, not
+# ${args_no_hyphens}, and --configs must come before it.
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --configs
+  - minigrid_confound
+  # - denoised
+  # - info_losses
+  - --task
+  - minigrid_navigate
+  - --minigrid_layout
+  - empty
+  - --max_episode_length
+  - "256"
+  - --mamba_context
+  - "False"
+  - --batch_length
+  - "64"
+  - --reconstruction_window
+  - "0"
+  - --video_pred_log
+  - "True"
+  - --probe_state
+  - "True"
+  - --task_train_size
+  - "4"
+  - --wandb_group
+  - empty4_b256
+  - --exp_label
+  - baseline_t4_longer
+  - ${args}

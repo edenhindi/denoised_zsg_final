@@ -10,7 +10,15 @@ defaults:
   offline_evaldir: ''
   seed: 0
   steps: 1e6
-  eval_every_collection_episodes: 200
+  # Agent frames between evaluations, in the same units as `steps` and
+  # `random_until`. Frames rather than collected episodes: when the episode length
+  # varies -- and especially when it shrinks as the agent improves -- a fixed
+  # episode count is a moving amount of experience, so evals drift closer together
+  # over a run and two conditions are no longer sampled at matching points.
+  # 4000 reproduces the cadence the old episode-based setting gave on bandits
+  # (envs 10 x max_episode_length 20 = 200 frames per iteration, evaluated every
+  # 200 episodes = every 20 iterations), i.e. 25 evals over a 1e5-frame run.
+  eval_every: 4000
   # Episodes per held-out task, not totals: eval and test run every task in their
   # split this many times, so coverage is balanced by construction.
   eval_repeats: 1
@@ -220,7 +228,7 @@ defaults:
   encoder:
     { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 5, minres: 4, mlp_layers: 2, mlp_units: 512, symlog_inputs: True }
   decoder:
-    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 5, minres: 4, mlp_layers: 2, mlp_units: 512, cnn_sigmoid: False, cnn_upsample: 'transpose', image_dist: mse, vector_dist: symlog_mse }
+    { mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: 'LayerNorm', cnn_depth: 32, kernel_size: 5, minres: 4, mlp_layers: 2, mlp_units: 512, cnn_sigmoid: False, cnn_upsample: 'transpose', image_dist: mse, vector_dist: symlog_mse, mlp_sigmoid: False }
   value_head: 'symlog_disc'
   reward_head: 'symlog_disc'
   # Feed the action to the reward head, so it is r = f(feat, a) and cannot fit reward
@@ -466,7 +474,12 @@ bandits:
   reach_wm_horizon_limit: 2e4
   logdir: ./bandits
   encoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64 }
-  decoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64 }
+  # mlp_sigmoid: one sigmoid per reconstruction head, so the prediction is
+  # sigmoid(endo) + sigmoid(exo) rather than a sum of unbounded means. `state` is
+  # the distractor (uniform [0, 1]), a one-hot and a binary reward, so each branch
+  # alone lands in the data's own range and the two cannot cancel. Implies plain
+  # `mse` for the vector dist: the mean is the prediction, not its symlog.
+  decoder: { mlp_keys: '.*', cnn_keys: '$^', mlp_layers: 2, mlp_units: 64, mlp_sigmoid: True }
   units: 64
   actor_dist: 'onehot'
   imag_gradient: 'reinforce'
@@ -513,6 +526,12 @@ bandits_drift:
 #   python dreamer.py --configs minigrid_confound --task minigrid_navigate --use_distractor False
 minigrid_confound:
   steps: 5e5
+  # ~20 eval points over the 5e5 run. Each eval is two simulate passes -- the val
+  # split and a matched train split, 20 + 20 episodes of up to 256 steps -- so it
+  # costs ~10k frames of env stepping against the 2560 a collection iteration
+  # collects. At 25k that is ~20% overhead; halving it doubles that. Evals land on
+  # collection-loop boundaries, so the effective cadence is 25.6k, not 25k.
+  eval_every: 25000
   # Must be positive: the world-model horizon curriculum divides by this, and the
   # default sentinel of -1 drives the horizon negative as training progresses.
   reach_wm_horizon_limit: 1e5
@@ -600,11 +619,12 @@ minigrid_fourrooms:
 # Needs labelled task_ids, i.e. task_split: True and train ids 0..task_train_size-1.
 denoised:
   use_exo: True
-  xi_ctx_cond: True
+  xi_ctx_cond: False
   xi_ctx_scale: 1.0
-  branch_decorr_scale: 0.5
+  branch_decorr_scale: 0.0
   reward_head_action: True
   reward_head_task: True
+  cont_head_task: True
 
 info_losses:
   use_infolosses: True
@@ -612,12 +632,12 @@ info_losses:
   # unless `denoised` is also passed.
   use_exo: True
   endo_exo_mi_scale: 0.0
-  act_endo_mi_scale: 0.1
-  act_exo_mi_scale: 0.1
+  act_endo_mi_scale: 1.0
+  act_exo_mi_scale: 1.0
   act_exo_mi_est: 'mine'
   rew_exo_mi_est: 'mine'
-  rew_endo_mi_scale: 0.1
-  rew_exo_mi_scale: 0.1
+  rew_endo_mi_scale: 1.0
+  rew_exo_mi_scale: 1.0
   embed_exo_mi_scale: 0.0
 
 debug:

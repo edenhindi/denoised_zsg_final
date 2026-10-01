@@ -570,8 +570,10 @@ def main(config):
         agent.load_state_dict(torch.load(logdir / "latest_model.pt"))
         agent._should_pretrain._once = False
 
-    eval_scheduler = tools.Every(config.eval_every_collection_episodes)
-    collected_episodes = 0
+    # Keyed on agent frames, not collected episodes: episode length varies between
+    # envs and shrinks as the agent improves, so a fixed episode count buys a
+    # drifting amount of experience and evals bunch up late in a run.
+    eval_scheduler = tools.Every(config.eval_every)
     # The whole val split, every task eval_repeats times: eval-to-eval movement is
     # then the model rather than the task draw, and per-task means stay balanced.
     eval_tasks = tasks.val_tasks() * config.eval_repeats
@@ -583,9 +585,9 @@ def main(config):
     eval_policy = functools.partial(agent, training=False)
     while logger.get_agent_frames() < config.steps:
         logger.write()
-        if eval_scheduler(collected_episodes):
+        if eval_scheduler(logger.get_agent_frames()):
             dreamer_eval_time = time.time()
-            print(f"Start evaluation (episodes {collected_episodes}).")
+            print(f"Start evaluation (frames {logger.get_agent_frames()}).")
             _, _, eval_return = tools.simulate(
                 eval_policy,
                 eval_envs,
@@ -645,7 +647,6 @@ def main(config):
             num_meta_episodes=config.num_meta_episodes,
             fallback_task=train_tasks[0],
         )
-        collected_episodes += config.envs
         logger.step += steps_taken * config.action_repeat
         logger.scalar("random_collection", float(in_random))
         agent.update_models(int(config.train_ratio * steps_taken / config.num_meta_episodes))
